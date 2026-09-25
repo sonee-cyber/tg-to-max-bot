@@ -1,138 +1,123 @@
-"""
-Telegram → МАКС зеркало канала.
-"""
-import logging
 import os
-import requests
+import time
+import logging
+import tempfile
 import telebot
 from dotenv import load_dotenv
+from telebot.apihelper import ApiTelegramException
 
-from max_api import MaxAPI
-from formatter import tg_entities_to_max_markdown, truncate
+import formatter
+import max_api
 
 load_dotenv()
 
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHANNEL_ID = int(os.getenv("TG_CHANNEL_ID", "0") or 0)
+MAX_CHAT_ID = os.getenv("MAX_CHAT_ID")
+
+if not TG_BOT_TOKEN or not TG_CHANNEL_ID or not MAX_CHAT_ID:
+    raise RuntimeError("Не заданы TG_BOT_TOKEN / TG_CHANNEL_ID / MAX_CHAT_ID в Variables")
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-TG_CHANNEL_ID = int(os.environ["TG_CHANNEL_ID"])
-MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
-MAX_CHAT_ID = os.environ["MAX_CHAT_ID"]
+# threaded=False важно для Railway - иначе 409 чаще ловится
+bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
 
-bot = telebot.TeleBot(TG_BOT_TOKEN, parse_mode=None)
-max_api = MaxAPI(MAX_BOT_TOKEN)
+def get_text_and_entities(msg):
+    """Достает текст и entities и из text и из caption"""
+    if msg.content_type == 'text':
+        return msg.text or "", msg.entities
+    else:
+        return msg.caption or "", msg.caption_entities
 
-# ──────────────────────────────────────────────
-def get_caption(message: telebot.types.Message) -> str:
-    raw = message.caption or message.text or ""
-    entities = message.caption_entities or message.entities or []
-    if entities:
-        return tg_entities_to_max_markdown(raw, entities)
-    return raw
-
-def download_tg_file(file_id: str) -> bytes:
+def download_tg_file(file_id: str) -> str:
+    """Скачивает файл из ТГ в /tmp и возвращает путь"""
     file_info = bot.get_file(file_id)
-    url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_info.file_path}"
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.content
+    downloaded = bot.download_file(file_info.file_path)
+    suffix = os.path.splitext(file_info.file_path)[-1] or ".tmp"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(downloaded)
+    tmp.close()
+    return tmp.name
 
-def pick_best_photo(photos) -> str:
-    return photos[-1].file_id
-
-# ──────────────────────────────────────────────
-def handle_text(message):
-    text = truncate(get_caption(message))
-    if not text: return
-    result = max_api.send_message(MAX_CHAT_ID, text)
-    logger.info(f"Текст отправлен в МАКС: {result}")
-
-def handle_photo(message):
-    caption = truncate(get_caption(message))
-    file_id = pick_best_photo(message.photo)
-    try:
-        photo_bytes = download_tg_file(file_id)
-        result = max_api.upload_and_send_photo(MAX_CHAT_ID, photo_bytes, caption)
-        logger.info(f"Фото отправлено в МАКС: {result}")
-    except Exception as e:
-        logger.error(f"Ошибка фото: {e}")
-        if caption:
-            max_api.send_message(MAX_CHAT_ID, caption)
-
-def handle_video(message):
-    caption = truncate(get_caption(message))
-    file_size = message.video.file_size or 0
-    if file_size > 50 * 1024 * 1024:
-        logger.warning(f"Видео большое {file_size}, шлю только текст")
-        if caption:
-            max_api.send_message(MAX_CHAT_ID, f"🎥 {caption}")
+@bot.channel_post_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice'])
+def handle_channel_post(message):
+    if message.chat.id != TG_CHANNEL_ID:
+        logger.info(f"Игнор пост из {message.chat.id}, жду {TG_CHANNEL_ID}")
         return
-    try:
-        video_bytes = download_tg_file(message.video.file_id)
-        result = max_api.upload_and_send_video(MAX_CHAT_ID, video_bytes, caption)
-        logger.info(f"Видео отправлено в МАКС: {result}")
-    except Exception as e:
-        logger.error(f"Ошибка видео: {e}")
-        if caption:
-            max_api.send_message(MAX_CHAT_ID, f"🎥 {caption}")
-
-def handle_document(message):
-    caption = truncate(get_caption(message))
-    try:
-        file_bytes = download_tg_file(message.document.file_id)
-        result = max_api.upload_and_send_file(MAX_CHAT_ID, file_bytes, message.document.file_name or "file", caption)
-        logger.info(f"Файл отправлен в МАКС: {result}")
-    except Exception as e:
-        logger.error(f"Ошибка файла: {e}")
-        if caption:
-            max_api.send_message(MAX_CHAT_ID, caption)
-
-def handle_animation(message):
-    caption = truncate(get_caption(message))
-    try:
-        file_bytes = download_tg_file(message.animation.file_id)
-        result = max_api.upload_and_send_file(MAX_CHAT_ID, file_bytes, "animation.gif", caption)
-        logger.info(f"GIF отправлен в МАКС: {result}")
-    except Exception as e:
-        logger.error(f"Ошибка GIF: {e}")
-        if caption:
-            max_api.send_message(MAX_CHAT_ID, caption)
-
-# ──────────────────────────────────────────────
-# ГЛАВНЫЙ ОБРАБОТЧИК - вот тут был фикс
-# ──────────────────────────────────────────────
-@bot.channel_post_handler(
-    content_types=['text','photo','video','document','animation','audio','voice','video_note','sticker'],
-    func=lambda m: m.chat.id == TG_CHANNEL_ID
-)
-def on_channel_post(message: telebot.types.Message):
-    logger.info(f"🔥 ПОЙМАЛ ПОСТ из канала {message.chat.id}: type={message.content_type} caption={message.caption or message.text}")
 
     try:
-        if message.content_type == "text":
-            handle_text(message)
-        elif message.content_type == "photo":
-            handle_photo(message)
-        elif message.content_type == "video":
-            handle_video(message)
-        elif message.content_type == "document":
-            handle_document(message)
-        elif message.content_type == "animation":
-            handle_animation(message)
-        else:
-            caption = get_caption(message)
-            if caption:
-                max_api.send_message(MAX_CHAT_ID, truncate(caption))
-            logger.info(f"Тип {message.content_type} - отправлен только текст")
+        text, entities = get_text_and_entities(message)
+        formatted_text = formatter.format_telegram_to_max(text, entities)
+
+        logger.info(f"🔥 ПОЙМАЛ ПОСТ из канала {message.chat.id}: type={message.content_type} caption={text[:100]}")
+
+        if message.content_type == 'text':
+            max_api.send_text(MAX_CHAT_ID, formatted_text)
+            logger.info("Текст отправлен в МАКС")
+
+        elif message.content_type == 'photo':
+            # берем самое большое фото
+            file_id = message.photo[-1].file_id
+            path = download_tg_file(file_id)
+            max_api.send_photo(MAX_CHAT_ID, path, formatted_text)
+            os.remove(path)
+            logger.info(f"Фото отправлено в МАКС: {path}")
+
+        elif message.content_type == 'video':
+            file_id = message.video.file_id
+            path = download_tg_file(file_id)
+            max_api.send_video(MAX_CHAT_ID, path, formatted_text)
+            os.remove(path)
+            logger.info("Видео отправлено в МАКС")
+
+        elif message.content_type in ('document', 'animation', 'audio', 'voice'):
+            file_id = (message.document or message.animation or message.audio or message.voice).file_id
+            path = download_tg_file(file_id)
+            max_api.send_document(MAX_CHAT_ID, path, formatted_text)
+            os.remove(path)
+            logger.info("Документ отправлен в МАКС")
+
     except Exception as e:
-        logger.exception(f"Ошибка в on_channel_post: {e}")
+        logger.exception(f"Ошибка при пересылке поста: {e}")
+
+# На случай если бот добавят в канал как админа и пишут обычные сообщения
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice'])
+def handle_message(message):
+    # это для теста в личке боту, в канале работает channel_post_handler
+    if str(message.chat.id) == str(TG_CHANNEL_ID):
+        handle_channel_post(message)
 
 if __name__ == "__main__":
-    logger.info(f"Бот запущен. Жду посты из канала {TG_CHANNEL_ID}...")
-    # Чистим вебхук чтобы не было 409 Conflict
-    bot.remove_webhook()
-    bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+    # Лечит 409 Conflict
+    try:
+        logger.info("Удаляю вебхук...")
+        bot.remove_webhook()
+        time.sleep(3)
+    except Exception as e:
+        logger.warning(f"Не смог удалить вебхук: {e}")
+
+    while True:
+        try:
+            logger.info(f"Бот запущен. Жду посты из канала {TG_CHANNEL_ID}...")
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=30,
+                skip_pending=True,
+                allowed_updates=["channel_post", "message"]
+            )
+        except ApiTelegramException as e:
+            if "409" in str(e):
+                logger.warning(f"409 Conflict - другой инстанс еще жив, жду 10 сек: {e}")
+                time.sleep(10)
+                continue
+            else:
+                logger.exception(f"Telegram API ошибка: {e}")
+                time.sleep(5)
+        except Exception as e:
+            logger.exception(f"Падение polling, перезапуск через 5 сек: {e}")
+            time.sleep(5)
