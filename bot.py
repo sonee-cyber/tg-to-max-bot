@@ -1,5 +1,6 @@
 import os, tempfile, logging, time, requests, telebot, threading
 from telebot.types import Message
+from telebot.apihelper import ApiTelegramException
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
@@ -77,7 +78,7 @@ def send_to_max_multi(file_paths, caption=None):
 
         r3 = requests.post("https://botapi.max.ru/messages", params={"access_token": MAX_BOT_TOKEN, "chat_id": int(MAX_CHAT_ID)}, json=payload, timeout=30)
         r3.raise_for_status()
-        logger.info(f"Ушло в MAX одним сообщением: {len(attachments)} файлов")
+        logger.info(f"Ушло в MAX одним сообщением: {len(attachments)} файлов | {caption}")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
@@ -137,20 +138,32 @@ def handle_channel_post(message: Message):
 if __name__ == "__main__":
     logger.info(f"Bot starting via {LOCAL_API}")
     fails_409 = 0
+    # Сносим вебхук один раз при старте
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        time.sleep(2)
+    except:
+        pass
+
     while True:
         try:
-            try:
-                bot.delete_webhook(drop_pending_updates=True)
-                time.sleep(2)
-            except:
-                pass
-            fails_409 = 0
-            bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
-        except Exception as e:
+            updates = bot.get_updates(offset=bot.last_update_id+1 if hasattr(bot, 'last_update_id') else 0, timeout=30, long_polling_timeout=30, allowed_updates=["channel_post"])
+            if updates:
+                bot.process_new_updates(updates)
+                fails_409 = 0
+        except ApiTelegramException as e:
             if "409" in str(e):
                 fails_409 += 1
-                wait = min(60 * fails_409, 300)
-                logger.warning(f"409 Conflict, жду {wait}с")
+                wait = min(30 * fails_409, 300)
+                logger.warning(f"409 Conflict - где-то еще запущен бот с этим токеном. Жду {wait}с перед повтором. Проверь что нет второго контейнера в Railway и бота на компе.")
                 time.sleep(wait)
+                try:
+                    bot.delete_webhook(drop_pending_updates=True)
+                except:
+                    pass
             else:
+                logger.exception("get_updates error")
                 time.sleep(5)
+        except Exception as e:
+            logger.exception("Loop error")
+            time.sleep(5)
