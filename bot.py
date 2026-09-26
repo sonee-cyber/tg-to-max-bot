@@ -14,14 +14,7 @@ bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-try:
-    bot.delete_webhook(drop_pending_updates=True)
-    time.sleep(3)
-except:
-    pass
-
-# --- буфер для альбомов ---
-album_buffer = {} # media_group_id -> {"paths": [], "caption": "", "timer": Timer}
+album_buffer = {}
 album_lock = threading.Lock()
 
 def download_tg_file(file_id: str) -> str:
@@ -42,21 +35,19 @@ def download_tg_file(file_id: str) -> str:
     return tmp.name
 
 def send_to_max_multi(file_paths, caption=None):
-    if not file_paths:
-        file_paths = []
     if isinstance(file_paths, str):
         file_paths = [file_paths]
+    if not file_paths:
+        file_paths = []
 
     attachments = []
     try:
         for path in file_paths:
+            if not path or not os.path.exists(path):
+                continue
             ext = os.path.splitext(path)[1].lower()
-            if ext in [".jpg",".jpeg",".png",".webp"]:
-                up_type, att_type = "image", "image"
-            elif ext in [".mp4",".mov",".avi",".mkv"]:
-                up_type, att_type = "video", "video"
-            else:
-                up_type, att_type = "file", "file"
+            up_type = "image" if ext in [".jpg",".jpeg",".png",".webp"] else "video" if ext in [".mp4",".mov",".avi",".mkv"] else "file"
+            att_type = up_type
 
             r = requests.post("https://botapi.max.ru/uploads", params={"access_token": MAX_BOT_TOKEN, "type": up_type}, timeout=30)
             r.raise_for_status()
@@ -69,10 +60,8 @@ def send_to_max_multi(file_paths, caption=None):
                 r2.raise_for_status()
                 j = r2.json()
 
-            token = None
-            if "token" in j:
-                token = j["token"]
-            elif "photos" in j:
+            token = j.get("token")
+            if not token and "photos" in j:
                 for v in j["photos"].values():
                     if isinstance(v, dict) and "token" in v:
                         token = v["token"]
@@ -88,7 +77,7 @@ def send_to_max_multi(file_paths, caption=None):
 
         r3 = requests.post("https://botapi.max.ru/messages", params={"access_token": MAX_BOT_TOKEN, "chat_id": int(MAX_CHAT_ID)}, json=payload, timeout=30)
         r3.raise_for_status()
-        logger.info(f"Ушло в MAX одним сообщением: {len(attachments)} файлов, caption={caption}")
+        logger.info(f"Ушло в MAX одним сообщением: {len(attachments)} файлов")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
@@ -97,12 +86,10 @@ def flush_album(mgid):
         data = album_buffer.pop(mgid, None)
     if not data:
         return
-    paths = data["paths"]
-    caption = data["caption"]
     try:
-        send_to_max_multi(paths, caption)
+        send_to_max_multi(data["paths"], data["caption"])
     finally:
-        for p in paths:
+        for p in data["paths"]:
             try: os.remove(p)
             except: pass
 
@@ -110,7 +97,6 @@ def flush_album(mgid):
 def handle_channel_post(message: Message):
     try:
         mgid = getattr(message, "media_group_id", None)
-
         file_id = None
         if message.content_type == 'photo':
             file_id = message.photo[-1].file_id
@@ -121,11 +107,10 @@ def handle_channel_post(message: Message):
         elif message.animation:
             file_id = message.animation.file_id
 
-        # Альбом - копим
         if mgid:
-            local_path = download_tg_file(file_id) if file_id else None
-            if not local_path:
+            if not file_id:
                 return
+            local_path = download_tg_file(file_id)
             with album_lock:
                 if mgid not in album_buffer:
                     album_buffer[mgid] = {"paths": [], "caption": "", "timer": None}
@@ -139,7 +124,6 @@ def handle_channel_post(message: Message):
                 t.start()
             return
 
-        # Одиночное сообщение
         local_path = download_tg_file(file_id) if file_id else None
         try:
             send_to_max_multi(local_path, message.caption or message.text)
@@ -147,15 +131,26 @@ def handle_channel_post(message: Message):
             if local_path and os.path.exists(local_path):
                 try: os.remove(local_path)
                 except: pass
-
     except Exception as e:
-        logger.exception(f"Ошибка handle: {e}")
+        logger.exception(f"handle error: {e}")
 
 if __name__ == "__main__":
     logger.info(f"Bot starting via {LOCAL_API}")
+    fails_409 = 0
     while True:
         try:
+            try:
+                bot.delete_webhook(drop_pending_updates=True)
+                time.sleep(2)
+            except:
+                pass
+            fails_409 = 0
             bot.infinity_polling(skip_pending=False, timeout=30, long_polling_timeout=30)
         except Exception as e:
-            logger.exception(f"Polling error: {e}")
-            time.sleep(30 if "409" in str(e) else 5)
+            if "409" in str(e):
+                fails_409 += 1
+                wait = min(60 * fails_409, 300)
+                logger.warning(f"409 Conflict, жду {wait}с")
+                time.sleep(wait)
+            else:
+                time.sleep(5)
