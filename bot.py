@@ -1,23 +1,20 @@
-import os, tempfile, logging, time, requests, telebot
+import os, tempfile, logging, time, requests, telebot, asyncio
 from telebot.types import Message
-from maxbot import MaxBot, PhotoAttachmentRequest, PhotoAttachmentPayload, VideoAttachmentRequest, VideoAttachmentPayload, FileAttachmentRequest, FileAttachmentPayload
+from maxapi import Bot as MaxBot
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 MAX_CHAT_ID = os.getenv("MAX_CHAT_ID")
 LOCAL_API = os.getenv("BOT_API_URL", "https://api.telegram.org").rstrip("/")
 
-if not TG_BOT_TOKEN:
-    raise RuntimeError("TG_BOT_TOKEN пустой")
-
 if "railway.internal" in LOCAL_API:
     telebot.apihelper.API_URL = LOCAL_API + "/bot{0}/{1}"
     telebot.apihelper.FILE_URL = LOCAL_API + "/file/bot{0}/{1}"
 
 bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
-max_bot = MaxBot(MAX_BOT_TOKEN) if MAX_BOT_TOKEN else None
+MAX_BOT = MaxBot(token=MAX_BOT_TOKEN) if MAX_BOT_TOKEN else None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
@@ -25,45 +22,41 @@ try:
     bot.delete_webhook(drop_pending_updates=True)
     time.sleep(3)
 except Exception as e:
-    logger.warning(f"delete_webhook: {e}")
+    logger.warning(e)
 
 def download_tg_file(file_id: str) -> str:
     r = requests.get(f"{LOCAL_API}/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
     data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(data.get("description", str(data)))
+        raise RuntimeError(data)
     file_path = data["result"]["file_path"]
     ext = os.path.splitext(file_path)[-1] or ".jpg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     tmp.close()
-    file_url = f"{LOCAL_API}/file/bot{TG_BOT_TOKEN}/{file_path}"
-    with requests.get(file_url, stream=True, timeout=600) as resp:
+    url = f"{LOCAL_API}/file/bot{TG_BOT_TOKEN}/{file_path}"
+    with requests.get(url, stream=True, timeout=600) as resp:
         resp.raise_for_status()
         with open(tmp.name, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024*1024):
+            for chunk in resp.iter_content(1024*1024):
                 if chunk: f.write(chunk)
     return tmp.name
 
 def send_to_max(file_path=None, caption=None):
-    if not max_bot or not MAX_CHAT_ID:
-        logger.error("MAX токен или чат не задан")
+    if not MAX_BOT or not MAX_CHAT_ID:
         return
-    try:
-        atts = []
+    async def _send():
         if file_path and os.path.exists(file_path):
             ext = os.path.splitext(file_path)[1].lower()
             if ext in [".jpg",".jpeg",".png",".webp"]:
-                up = max_bot.uploads.upload_photo_from_file(file_path)
-                atts = [PhotoAttachmentRequest(payload=PhotoAttachmentPayload(token=up.token))]
-            elif ext in [".mp4",".mov",".avi",".mkv"]:
-                up = max_bot.uploads.upload_video_from_file(file_path)
-                atts = [VideoAttachmentRequest(payload=VideoAttachmentPayload(token=up.token))]
+                await MAX_BOT.send_image(file_path, chat_id=int(MAX_CHAT_ID), text=caption or "")
             else:
-                up = max_bot.uploads.upload_media_from_file(file_path)
-                atts = [FileAttachmentRequest(payload=FileAttachmentPayload(token=up.token))]
-
-        max_bot.messages.send(chat_id=int(MAX_CHAT_ID), text=caption or "", attachments=atts or None)
+                await MAX_BOT.send_file(file_path, chat_id=int(MAX_CHAT_ID), text=caption or "")
+        else:
+            await MAX_BOT.send_message(chat_id=int(MAX_CHAT_ID), text=caption or "")
         logger.info(f"Ушло в MAX: {caption}")
+
+    try:
+        asyncio.run(_send())
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
@@ -79,21 +72,18 @@ def handle_channel_post(message: Message):
 
         if file_id:
             local_path = download_tg_file(file_id)
-            send_to_max(file_path=local_path, caption=message.caption)
+            send_to_max(local_path, message.caption)
         else:
-            send_to_max(caption=message.text or message.caption)
-    except Exception as e:
-        logger.exception(f"Ошибка handle: {e}")
+            send_to_max(None, message.text or message.caption)
     finally:
         if local_path and os.path.exists(local_path):
             try: os.remove(local_path)
             except: pass
 
 if __name__ == "__main__":
-    logger.info(f"Bot starting via {LOCAL_API}")
+    logger.info("Bot starting...")
     while True:
         try:
-            bot.infinity_polling(skip_pending=False, long_polling_timeout=30, timeout=30)
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
         except Exception as e:
-            if "409" in str(e): time.sleep(30)
-            else: time.sleep(5)
+            time.sleep(30 if "409" in str(e) else 5)
