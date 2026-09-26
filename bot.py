@@ -7,14 +7,25 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 MAX_CHAT_ID = os.getenv("MAX_CHAT_ID")
 
+if not TG_BOT_TOKEN:
+    raise RuntimeError("TG_BOT_TOKEN пустой! Проверь Variables в Railway")
+
 bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- СКАЧИВАНИЕ ЛЮБОГО РАЗМЕРА ДО 2ГБ ---
+# ВАЖНО: Убиваем все старые getUpdates / webhook перед стартом
+# Это чинит твою ошибку 409
+try:
+    logger.info("Удаляю webhook...")
+    bot.delete_webhook(drop_pending_updates=True)
+    time.sleep(3) # даем Телеге время отпустить соединение
+except Exception as e:
+    logger.warning(f"delete_webhook не сработал: {e}")
 
+# --- СКАЧИВАНИЕ ЛЮБОГО РАЗМЕРА ДО 2ГБ ---
 def download_tg_file(file_id: str) -> str:
-    # 1. получаем file_path напрямую через Bot API
     r = requests.get(
         f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getFile",
         params={"file_id": file_id},
@@ -27,7 +38,6 @@ def download_tg_file(file_id: str) -> str:
     file_path = data["result"]["file_path"]
     ext = os.path.splitext(file_path)[-1] or ".mp4"
     
-    # 2. качаем стримингом
     url = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{file_path}"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
     tmp.close()
@@ -35,7 +45,7 @@ def download_tg_file(file_id: str) -> str:
     with requests.get(url, stream=True, timeout=180) as resp:
         resp.raise_for_status()
         with open(tmp.name, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024*1024): # по 1мб
+            for chunk in resp.iter_content(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
     
@@ -44,13 +54,8 @@ def download_tg_file(file_id: str) -> str:
 
 # --- ОТПРАВКА В МАКС ---
 def send_to_max(file_path=None, caption=None):
-    # твоя функция отправки в MAX как была, не меняй
-    # тут должен быть твой код отправки через MAX API
+    # твоя функция отправки в MAX как была
     pass
-
-# --- ТВОЙ СТАРЫЙ ОБРАБОТЧИК КАНАЛА ---
-# Оставь его, только внутри где было bot.get_file / bot.download_file
-# замени на download_tg_file(file_id)
 
 @bot.channel_post_handler(content_types=['photo', 'video', 'document', 'animation', 'text'])
 def handle_channel_post(message: Message):
@@ -59,16 +64,35 @@ def handle_channel_post(message: Message):
         if message.content_type == 'photo':
             file_id = message.photo[-1].file_id
         elif message.content_type in ['video', 'document', 'animation']:
-            file_id = message.document.file_id if message.document else message.video.file_id if message.video else message.animation.file_id
+            if message.document:
+                file_id = message.document.file_id
+            elif message.video:
+                file_id = message.video.file_id
+            elif message.animation:
+                file_id = message.animation.file_id
 
         if file_id:
-            local_path = download_tg_file(file_id) # <--- ВОТ ЭТОТ ВЫЗОВ
+            local_path = download_tg_file(file_id)
             send_to_max(file_path=local_path, caption=message.caption)
-            os.remove(local_path)
+            if os.path.exists(local_path):
+                os.remove(local_path)
         else:
             send_to_max(caption=message.text or message.caption)
             
     except Exception as e:
         logger.exception(e)
 
-bot.infinity_polling()
+if __name__ == "__main__":
+    logger.info("Bot starting infinity_polling...")
+    # Автоперезапуск если что-то упадет
+    while True:
+        try:
+            bot.infinity_polling(
+                skip_pending=True,
+                long_polling_timeout=20,
+                timeout=30,
+                allowed_updates=[] # слушаем все
+            )
+        except Exception as e:
+            logger.exception(f"Polling упал, перезапуск через 5 сек: {e}")
+            time.sleep(5)
