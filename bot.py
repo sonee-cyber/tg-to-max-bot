@@ -40,22 +40,33 @@ def send_to_max_multi(file_paths, caption=None):
         file_paths = [file_paths]
     if not file_paths:
         file_paths = []
+    file_paths = [p for p in file_paths if p and os.path.exists(p)]
+
+    if not MAX_BOT_TOKEN or not MAX_CHAT_ID:
+        logger.error("MAX_BOT_TOKEN / MAX_CHAT_ID пустые")
+        return
+
+    headers = {"Authorization": MAX_BOT_TOKEN.strip()}  # ВАЖНО: без Bearer, просто токен
+    base = "https://platform-api.max.ru"
 
     attachments = []
     try:
         for path in file_paths:
-            if not path or not os.path.exists(path):
-                continue
             ext = os.path.splitext(path)[1].lower()
             up_type = "image" if ext in [".jpg",".jpeg",".png",".webp"] else "video" if ext in [".mp4",".mov",".avi",".mkv"] else "file"
             att_type = up_type
 
-            r = requests.post("https://botapi.max.ru/uploads", params={"access_token": MAX_BOT_TOKEN, "type": up_type}, timeout=30)
+            # 1. Получаем ссылку для загрузки - новый API
+            r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
+            if r.status_code == 401:
+                logger.error(f"401 от MAX. Токен отклонен. Ответ: {r.text}")
+                r.raise_for_status()
             r.raise_for_status()
             upload_url = r.json().get("url")
             if not upload_url:
-                raise RuntimeError(r.text)
+                raise RuntimeError(f"No upload url: {r.text}")
 
+            # 2. Заливаем файл на предподписанный URL (без авторизации)
             with open(path, "rb") as f:
                 r2 = requests.post(upload_url, files={"data": f}, timeout=120)
                 r2.raise_for_status()
@@ -68,7 +79,7 @@ def send_to_max_multi(file_paths, caption=None):
                         token = v["token"]
                         break
             if not token:
-                raise RuntimeError(f"No token: {j}")
+                raise RuntimeError(f"No token in upload response: {j}")
 
             attachments.append({"type": att_type, "payload": {"token": token}})
 
@@ -76,7 +87,7 @@ def send_to_max_multi(file_paths, caption=None):
         if attachments:
             payload["attachments"] = attachments
 
-        r3 = requests.post("https://botapi.max.ru/messages", params={"access_token": MAX_BOT_TOKEN, "chat_id": int(MAX_CHAT_ID)}, json=payload, timeout=30)
+        r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
         r3.raise_for_status()
         logger.info(f"Ушло в MAX одним сообщением: {len(attachments)} файлов | {caption}")
     except Exception as e:
@@ -138,10 +149,9 @@ def handle_channel_post(message: Message):
 if __name__ == "__main__":
     logger.info(f"Bot starting via {LOCAL_API}")
     fails_409 = 0
-    # Сносим вебхук один раз при старте
     try:
         bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(2)
+        time.sleep(1)
     except:
         pass
 
@@ -155,7 +165,7 @@ if __name__ == "__main__":
             if "409" in str(e):
                 fails_409 += 1
                 wait = min(30 * fails_409, 300)
-                logger.warning(f"409 Conflict - где-то еще запущен бот с этим токеном. Жду {wait}с перед повтором. Проверь что нет второго контейнера в Railway и бота на компе.")
+                logger.warning(f"409 Conflict - где-то еще запущен бот с этим токеном. Жду {wait}с.")
                 time.sleep(wait)
                 try:
                     bot.delete_webhook(drop_pending_updates=True)
