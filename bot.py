@@ -55,28 +55,37 @@ def download_tg_file(file_id: str):
                 seen.add(c)
                 uniq.append(c)
 
+        # Пробуем и 8081 (прямо bot-api) и 80 (nginx) — в aiogram образе nginx фиксит full-path
+        bases = [LOCAL_API]
+        if ":8081" in LOCAL_API:
+            bases.append(LOCAL_API.replace(":8081", ""))
+            bases.append(LOCAL_API.replace(":8081", ":80"))
+        else:
+            # если вдруг указан без порта — пробуем 8081 тоже
+            bases.append(LOCAL_API.rstrip("/") + ":8081")
+
         last_exc = None
-        for cand in uniq:
-            url = f"{LOCAL_API}/file/bot{TG_BOT_TOKEN}/{cand}"
-            # Чиним // кроме http://
-            url = url.replace("://", "___PROTO___").replace("//", "/").replace("___PROTO___", "://")
-            logger.info(f"Trying download: {url}")
-            try:
-                with requests.get(url, stream=True, timeout=600) as resp:
-                    resp.raise_for_status()
-                    with open(tmp.name, "wb") as f:
-                        for ch in resp.iter_content(1024*1024):
-                            if ch: f.write(ch)
-                logger.info(f"Successfully downloaded via {url}")
-                return tmp.name
-            except Exception as e:
-                last_exc = e
-                if "404" in str(e):
-                    logger.warning(f"404 for {url}, пробую следующий вариант")
+        for base in bases:
+            for cand in uniq:
+                url = f"{base}/file/bot{TG_BOT_TOKEN}/{cand}"
+                # Чиним // кроме http://
+                url = url.replace("://", "___PROTO___").replace("//", "/").replace("___PROTO___", "://")
+                logger.info(f"Trying download: {url}")
+                try:
+                    with requests.get(url, stream=True, timeout=600) as resp:
+                        resp.raise_for_status()
+                        with open(tmp.name, "wb") as f:
+                            for ch in resp.iter_content(1024*1024):
+                                if ch: f.write(ch)
+                    logger.info(f"Successfully downloaded via {url}")
+                    return tmp.name
+                except Exception as e:
+                    last_exc = e
+                    if "404" in str(e):
+                        logger.warning(f"404 for {url}, пробую следующий вариант")
+                        continue
+                    logger.warning(f"Failed {url}: {e}")
                     continue
-                # для других ошибок тоже пробуем дальше, если есть варианты
-                logger.warning(f"Failed {url}: {e}")
-                continue
 
         if last_exc:
             raise last_exc
