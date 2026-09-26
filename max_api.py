@@ -27,7 +27,6 @@ def _upload(file_path: str, upload_type: str):
         return data
 
 def _send(chat_id: str, text: str = "", attachments=None):
-    params = {"chat_id": chat_id}
     payload = {}
     if text:
         payload["text"] = text[:4000]
@@ -35,7 +34,7 @@ def _send(chat_id: str, text: str = "", attachments=None):
     if attachments:
         payload["attachments"] = attachments
 
-    r = requests.post(f"{BASE_URL}/messages", params=params, headers=HEADERS, json=payload, timeout=30)
+    r = requests.post(f"{BASE_URL}/messages", params={"chat_id": chat_id}, headers=HEADERS, json=payload, timeout=30)
     if r.status_code != 200:
         logger.error(f"MAX API ошибка {r.status_code}: {r.text}")
     r.raise_for_status()
@@ -44,19 +43,27 @@ def _send(chat_id: str, text: str = "", attachments=None):
 def send_text(chat_id: str, text: str):
     return _send(chat_id, text=text)
 
+# было: 1 фото = 1 сообщение
 def send_photo(chat_id: str, photo_path: str, caption: str = ""):
-    data = _upload(photo_path, "image")
-    # data = {"photos": {"id": {"token": "..."}}} - так возвращает MAX для фото
-    if "photos" in data:
-        payload = {"photos": data["photos"]}
-    else:
-        payload = {"token": data.get("token")}
-    att = [{"type": "image", "payload": payload}]
-    return _send(chat_id, text=caption, attachments=att)
+    return send_photos(chat_id, [photo_path], caption)
+
+# СТАЛО: альбом = 1 сообщение с N вложениями
+def send_photos(chat_id: str, photo_paths: list, caption: str = ""):
+    attachments = []
+    for path in photo_paths:
+        data = _upload(path, "image")
+        if "photos" in data:
+            payload = {"photos": data["photos"]}
+        else:
+            payload = {"token": data.get("token")}
+        attachments.append({"type": "image", "payload": payload})
+    return _send(chat_id, text=caption, attachments=attachments)
 
 def send_video(chat_id: str, video_path: str, caption: str = ""):
     data = _upload(video_path, "video")
     token = data.get("token")
+    if not token:
+        raise RuntimeError(f"MAX не вернул token для видео: {data}")
     att = [{"type": "video", "payload": {"token": token}}]
     return _send(chat_id, text=caption, attachments=att)
 
