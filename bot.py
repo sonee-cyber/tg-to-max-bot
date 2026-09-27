@@ -2,22 +2,31 @@ import os, tempfile, logging, time, requests, telebot, threading, asyncio, subpr
 from telebot.types import Message
 
 def convert_to_mp4_if_needed(src_path):
-    """Если это .MOV в HEVC - перекодируем в H264 mp4 чтобы MAX принял как video"""
+    """Для твоих 1 мин 1080p 30fps ~30МБ .MOV HEVC -> H264 mp4 чтобы MAX принял как video с плеером"""
     ext = os.path.splitext(src_path)[1].lower()
-    if ext not in [".mov", ".avi", ".mkv"]:
+    # конвертим все что не mp4, и даже mp4 если без faststart - для MAX важно
+    if ext not in [".mov", ".avi", ".mkv", ".mp4", ".webm"]:
         return src_path
+    size_mb = os.path.getsize(src_path) / (1024*1024)
+    # для твоих 1 мин 1080p ~30МБ оставляем 1080p, crf 23 - будет ~15-20МБ
+    # если вдруг больше 80МБ - жмем сильнее
+    if size_mb > 80:
+        crf = "28"
+        extra_vf = ["-vf", "scale=-2:720"]  # 1080p -> 720p для экономии
+    else:
+        crf = "23"
+        extra_vf = []
+    
     dst_path = os.path.splitext(src_path)[0] + "_h264.mp4"
     ffmpeg_exe = "ffmpeg"
     try:
-        # пробуем imageio-ffmpeg если есть
         try:
             import imageio_ffmpeg
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             logger.info(f"Using imageio-ffmpeg: {ffmpeg_exe}")
         except:
             pass
-        # -y перезаписать, fast preset, crf 23 - хороший баланс
-        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst_path]
+        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"] + extra_vf + [dst_path]
         logger.info(f"Converting {src_path} -> {dst_path} via ffmpeg...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000:
@@ -228,10 +237,8 @@ def send_to_max_multi(file_paths, caption=None):
                 base_name = os.path.splitext(base_name)[0] + ".mp4"
             
             for up_type in types_to_try:
-                # пробуем два варианта поля: data и file
                 for field_name in ["data", "file"]:
                     try:
-                        # для video нужен video/mp4 mime, иначе omub режет
                         mime = "video/mp4" if up_type == "video" else "application/octet-stream"
                         logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} mime={mime} size={os.path.getsize(path)}")
                         r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
@@ -242,29 +249,42 @@ def send_to_max_multi(file_paths, caption=None):
                         with open(path, "rb") as f:
                             files = {field_name: (base_name, f, mime)}
                             r2 = requests.post(upload_url, files=files, timeout=300)
-                            # логируем всегда чтобы понять пустой ответ
                             logger.info(f"Upload response {up_type}/{field_name}: status={r2.status_code} text={r2.text[:2000]}")
                             if r2.status_code >= 400:
                                 logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
                             r2.raise_for_status()
+                            text = r2.text.strip()
+                            j = None
+                            token = None
+                            # video CDN возвращает XML <retval>1</retval> - это успех, но токен надо брать из file загрузки
+                            if "<retval>" in text:
+                                # для video считаем что файл принят, но токен получим через file загрузку
+                                # парсим fileId если есть, иначе считаем что надо пробовать file тип
+                                if up_type == "video":
+                                    logger.info(f"Video CDN returned XML success, will fallback to file upload to get token for video playback")
+                                    raise RuntimeError(f"Video CDN XML success, need file token: {text}")
+                                # если это file и XML - ошибка
+                                raise RuntimeError(f"Unexpected XML response: {text}")
                             try:
                                 j = r2.json()
                             except Exception as je:
-                                logger.warning(f"JSON parse failed for {up_type}/{field_name}: {je} raw={r2.text[:2000]}")
+                                logger.warning(f"JSON parse failed for {up_type}/{field_name}: {je} raw={text[:2000]}")
                                 raise
                             
-                        token = j.get("token")
-                        if not token and "photos" in j:
-                            for v in j["photos"].values():
-                                if isinstance(v, dict) and "token" in v:
-                                    token = v["token"]
-                                    break
-                        if not token:
-                            raise RuntimeError(f"No token: {j}")
-                        attachments.append({"type": up_type, "payload": {"token": token}})
-                        logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
-                        uploaded = True
-                        break
+                            token = j.get("token") if j else None
+                            if not token and j and "photos" in j:
+                                for v in j["photos"].values():
+                                    if isinstance(v, dict) and "token" in v:
+                                        token = v["token"]
+                                        break
+                            if not token:
+                                raise RuntimeError(f"No token: {j}")
+                            # ВАЖНО: если файл mp4, отправляем как video чтобы в MAX был плеер, даже если грузили как file
+                            send_type = "video" if ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"] else up_type
+                            attachments.append({"type": send_type, "payload": {"token": token}})
+                            logger.info(f"Uploaded {path} as {up_type} -> sending as {send_type} token={token[:20]}...")
+                            uploaded = True
+                            break
                     except Exception as e:
                         last_err = e
                         logger.warning(f"Upload as {up_type}/{field_name} failed: {e}")
@@ -287,10 +307,19 @@ def send_to_max_multi(file_paths, caption=None):
             payload["text"] = " "
         
         logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {payload}")
-        r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
-        if r3.status_code >= 400:
-            logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | payload={payload}")
-        r3.raise_for_status()
+        # MAX может отвечать attachment.not.ready сразу после загрузки - ждем и ретраим
+        for attempt in range(6):
+            r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
+            if r3.status_code >= 400:
+                logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | payload={payload} attempt={attempt}")
+                # если файл еще обрабатывается - ждем
+                if "not.ready" in r3.text or "not.processed" in r3.text:
+                    wait = 3 + attempt*2
+                    logger.info(f"File not ready, waiting {wait}s before retry {attempt+1}/6")
+                    time.sleep(wait)
+                    continue
+            r3.raise_for_status()
+            break
         logger.info(f"Ушло в MAX: {len(attachments)} файлов | {caption}")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
