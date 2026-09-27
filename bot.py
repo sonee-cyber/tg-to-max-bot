@@ -163,23 +163,23 @@ def send_to_max_multi(file_paths, caption=None):
     try:
         for path in file_paths:
             ext = os.path.splitext(path)[1].lower()
-            # MAX часто не принимает .MOV как video -> пробуем как file
-            preferred_type = "image" if ext in [".jpg",".jpeg",".png",".webp"] else "video" if ext in [".mp4",".avi",".mkv"] else "file"
-            # для .mov сразу пробуем file, но оставим fallback
-            if ext == ".mov":
+            # хотим чтобы видео игралось в MAX как видео, а не как файл
+            if ext in [".jpg",".jpeg",".png",".webp"]:
+                preferred_type = "image"
+                types_to_try = ["image"]
+            elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
+                # для всех видео сначала пробуем как video, потом как file (fallback)
+                preferred_type = "video"
+                types_to_try = ["video", "file"]
+            else:
                 preferred_type = "file"
-            
-            types_to_try = [preferred_type]
-            if preferred_type == "file" and ext in [".mov", ".mp4"]:
-                types_to_try.append("video")
-            if preferred_type == "video":
-                types_to_try.append("file")
+                types_to_try = ["file", "video"]
             
             uploaded = False
             last_err = None
             # для CDN важно имя файла с маленькой буквы и правильное расширение
             base_name = os.path.basename(path)
-            # переименовываем .MOV -> .mp4 для совместимости, контент тот же
+            # .MOV -> .mp4 для совместимости CDN omub.okcdn.ru
             if ext == ".mov":
                 base_name = os.path.splitext(base_name)[0] + ".mp4"
             
@@ -187,14 +187,16 @@ def send_to_max_multi(file_paths, caption=None):
                 # пробуем два варианта поля: data и file
                 for field_name in ["data", "file"]:
                     try:
-                        logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} size={os.path.getsize(path)}")
+                        # для video нужен video/mp4 mime, иначе omub режет
+                        mime = "video/mp4" if up_type == "video" else "application/octet-stream"
+                        logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} mime={mime} size={os.path.getsize(path)}")
                         r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
                         r.raise_for_status()
                         upload_url = r.json().get("url")
                         if not upload_url:
                             raise RuntimeError(f"No upload url: {r.text}")
                         with open(path, "rb") as f:
-                            files = {field_name: (base_name, f, "application/octet-stream")}
+                            files = {field_name: (base_name, f, mime)}
                             r2 = requests.post(upload_url, files=files, timeout=300)
                             if r2.status_code >= 400:
                                 logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
