@@ -295,32 +295,50 @@ def send_to_max_multi(file_paths, caption=None):
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
         # MAX не любит пустой text с файлом, убираем если пусто
-        payload = {}
-        if caption:
-            payload["text"] = caption
+        # пробуем отправить токен как video (плеер) и как file (fallback)
+        # т.к. file токен не всегда принимается как video (503)
+        payloads_to_try = []
         if attachments:
-            payload["attachments"] = attachments
-        if not payload.get("text") and not attachments:
+            # attachments сейчас содержит 1 элемент с типом video (мы форсим video для mp4)
+            token = attachments[0]["payload"]["token"]
+            orig_type = attachments[0]["type"]
+            # сначала пробуем как video (хотим плеер), потом как file
+            if orig_type == "video":
+                payloads_to_try.append([{"type": "video", "payload": {"token": token}}])
+                payloads_to_try.append([{"type": "file", "payload": {"token": token}}])
+            else:
+                payloads_to_try.append(attachments)
+        else:
             return
-        # если только файл без текста - добавим пробел чтобы не было пустого
-        if not payload.get("text"):
-            payload["text"] = " "
-        
-        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {payload}")
-        # MAX может отвечать attachment.not.ready сразу после загрузки - ждем и ретраим
-        for attempt in range(6):
-            r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
-            if r3.status_code >= 400:
-                logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | payload={payload} attempt={attempt}")
-                # если файл еще обрабатывается - ждем
-                if "not.ready" in r3.text or "not.processed" in r3.text:
-                    wait = 3 + attempt*2
-                    logger.info(f"File not ready, waiting {wait}s before retry {attempt+1}/6")
-                    time.sleep(wait)
-                    continue
-            r3.raise_for_status()
-            break
-        logger.info(f"Ушло в MAX: {len(attachments)} файлов | {caption}")
+
+        for attach_variant in payloads_to_try:
+            payload = {}
+            if caption:
+                payload["text"] = caption
+            payload["attachments"] = attach_variant
+            if not payload.get("text"):
+                payload["text"] = " "
+
+            logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: type={attach_variant[0]['type']} token={token[:20]}...")
+            # ретраи на not.ready и на 503 service.unavailable
+            for attempt in range(8):
+                r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
+                if r3.status_code >= 400:
+                    logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | type={attach_variant[0]['type']} attempt={attempt}")
+                    if "not.ready" in r3.text or "not.processed" in r3.text or "service.unavailable" in r3.text or r3.status_code in [502,503,504]:
+                        wait = 3 + attempt*2
+                        logger.info(f"Retrying after {wait}s... ({attempt+1}/8)")
+                        time.sleep(wait)
+                        continue
+                    # если ошибка типа токена - пробуем следующий вариант (video->file)
+                    if attach_variant[0]["type"] == "video":
+                        logger.info("Video send failed, will try as file")
+                        break
+                r3.raise_for_status()
+                logger.info(f"Ушло в MAX: {len(attach_variant)} файлов как {attach_variant[0]['type']} | {caption}")
+                return
+        # если все варианты не прошли
+        raise RuntimeError(f"Не удалось отправить в MAX после всех попыток")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
