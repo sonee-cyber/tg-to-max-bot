@@ -1,5 +1,47 @@
-import os, tempfile, logging, time, requests, telebot, threading, asyncio
+import os, tempfile, logging, time, requests, telebot, threading, asyncio, subprocess, shutil
 from telebot.types import Message
+
+def convert_to_mp4_if_needed(src_path):
+    """Если это .MOV в HEVC - перекодируем в H264 mp4 чтобы MAX принял как video"""
+    ext = os.path.splitext(src_path)[1].lower()
+    if ext not in [".mov", ".avi", ".mkv"]:
+        return src_path
+    dst_path = os.path.splitext(src_path)[0] + "_h264.mp4"
+    ffmpeg_exe = "ffmpeg"
+    try:
+        # пробуем imageio-ffmpeg если есть
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            logger.info(f"Using imageio-ffmpeg: {ffmpeg_exe}")
+        except:
+            pass
+        # -y перезаписать, fast preset, crf 23 - хороший баланс
+        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", dst_path]
+        logger.info(f"Converting {src_path} -> {dst_path} via ffmpeg...")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000:
+            orig = os.path.getsize(src_path)
+            new = os.path.getsize(dst_path)
+            logger.info(f"Converted OK: {orig} -> {new} bytes ({orig/new:.1f}x)")
+            # удаляем оригинал чтобы не забивать диск
+            try:
+                os.remove(src_path)
+            except:
+                pass
+            return dst_path
+        else:
+            logger.warning(f"ffmpeg failed code={result.returncode}: {result.stderr[:2000]}")
+            # удаляем битый dst
+            try:
+                if os.path.exists(dst_path):
+                    os.remove(dst_path)
+            except:
+                pass
+            return src_path
+    except Exception as e:
+        logger.warning(f"Convert error (ffmpeg not available?): {e}")
+        return src_path
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
@@ -103,6 +145,8 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
         logger.info(f"Trying Telethon direct download for msg {message_id} in {chat_id}")
         path = download_via_telethon_sync(chat_id, message_id)
         if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            # конвертим MOV -> mp4 H264 для MAX video
+            path = convert_to_mp4_if_needed(path)
             return path
         logger.warning("Telethon failed, falling back to Bot API")
 
@@ -198,10 +242,17 @@ def send_to_max_multi(file_paths, caption=None):
                         with open(path, "rb") as f:
                             files = {field_name: (base_name, f, mime)}
                             r2 = requests.post(upload_url, files=files, timeout=300)
+                            # логируем всегда чтобы понять пустой ответ
+                            logger.info(f"Upload response {up_type}/{field_name}: status={r2.status_code} text={r2.text[:2000]}")
                             if r2.status_code >= 400:
                                 logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
                             r2.raise_for_status()
-                            j = r2.json()
+                            try:
+                                j = r2.json()
+                            except Exception as je:
+                                logger.warning(f"JSON parse failed for {up_type}/{field_name}: {je} raw={r2.text[:2000]}")
+                                raise
+                            
                         token = j.get("token")
                         if not token and "photos" in j:
                             for v in j["photos"].values():
