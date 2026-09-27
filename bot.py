@@ -177,37 +177,47 @@ def send_to_max_multi(file_paths, caption=None):
             
             uploaded = False
             last_err = None
+            # для CDN важно имя файла с маленькой буквы и правильное расширение
+            base_name = os.path.basename(path)
+            # переименовываем .MOV -> .mp4 для совместимости, контент тот же
+            if ext == ".mov":
+                base_name = os.path.splitext(base_name)[0] + ".mp4"
+            
             for up_type in types_to_try:
-                try:
-                    logger.info(f"Uploading {path} as {up_type} (ext={ext} size={os.path.getsize(path)})")
-                    r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
-                    r.raise_for_status()
-                    upload_url = r.json().get("url")
-                    if not upload_url:
-                        raise RuntimeError(f"No upload url: {r.text}")
-                    with open(path, "rb") as f:
-                        r2 = requests.post(upload_url, files={"data": f}, timeout=300)
-                        # логируем тело ошибки если 400
-                        if r2.status_code >= 400:
-                            logger.warning(f"Upload {up_type} failed {r2.status_code}: {r2.text[:500]}")
-                        r2.raise_for_status()
-                        j = r2.json()
-                    token = j.get("token")
-                    if not token and "photos" in j:
-                        for v in j["photos"].values():
-                            if isinstance(v, dict) and "token" in v:
-                                token = v["token"]
-                                break
-                    if not token:
-                        raise RuntimeError(f"No token: {j}")
-                    attachments.append({"type": up_type, "payload": {"token": token}})
-                    logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
-                    uploaded = True
+                # пробуем два варианта поля: data и file
+                for field_name in ["data", "file"]:
+                    try:
+                        logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} size={os.path.getsize(path)}")
+                        r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
+                        r.raise_for_status()
+                        upload_url = r.json().get("url")
+                        if not upload_url:
+                            raise RuntimeError(f"No upload url: {r.text}")
+                        with open(path, "rb") as f:
+                            files = {field_name: (base_name, f, "application/octet-stream")}
+                            r2 = requests.post(upload_url, files=files, timeout=300)
+                            if r2.status_code >= 400:
+                                logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
+                            r2.raise_for_status()
+                            j = r2.json()
+                        token = j.get("token")
+                        if not token and "photos" in j:
+                            for v in j["photos"].values():
+                                if isinstance(v, dict) and "token" in v:
+                                    token = v["token"]
+                                    break
+                        if not token:
+                            raise RuntimeError(f"No token: {j}")
+                        attachments.append({"type": up_type, "payload": {"token": token}})
+                        logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
+                        uploaded = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(f"Upload as {up_type}/{field_name} failed: {e}")
+                        continue
+                if uploaded:
                     break
-                except Exception as e:
-                    last_err = e
-                    logger.warning(f"Upload as {up_type} failed: {e}, trying next")
-                    continue
             
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
