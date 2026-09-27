@@ -4,15 +4,12 @@ from telebot.types import Message
 def convert_to_mp4_if_needed(src_path):
     """Для твоих 1 мин 1080p 30fps ~30МБ .MOV HEVC -> H264 mp4 чтобы MAX принял как video с плеером"""
     ext = os.path.splitext(src_path)[1].lower()
-    # конвертим все что не mp4, и даже mp4 если без faststart - для MAX важно
     if ext not in [".mov", ".avi", ".mkv", ".mp4", ".webm"]:
         return src_path
     size_mb = os.path.getsize(src_path) / (1024*1024)
-    # для твоих 1 мин 1080p ~30МБ оставляем 1080p, crf 23 - будет ~15-20МБ
-    # если вдруг больше 80МБ - жмем сильнее
     if size_mb > 80:
         crf = "28"
-        extra_vf = ["-vf", "scale=-2:720"]  # 1080p -> 720p для экономии
+        extra_vf = ["-vf", "scale=-2:720"]
     else:
         crf = "23"
         extra_vf = []
@@ -26,7 +23,9 @@ def convert_to_mp4_if_needed(src_path):
             logger.info(f"Using imageio-ffmpeg: {ffmpeg_exe}")
         except:
             pass
-        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"] + extra_vf + [dst_path]
+        # ВАЖНО: -pix_fmt yuv420p -profile:v high для совместимости с MAX плеером
+        # иначе HEVC из телеги дает yuv420p10le и MAX не ест
+        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-pix_fmt", "yuv420p", "-profile:v", "high", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"] + extra_vf + [dst_path]
         logger.info(f"Converting {src_path} -> {dst_path} via ffmpeg...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000:
@@ -216,17 +215,13 @@ def send_to_max_multi(file_paths, caption=None):
     try:
         for path in file_paths:
             ext = os.path.splitext(path)[1].lower()
-            # хотим чтобы видео игралось в MAX как видео, а не как файл
+            # для видео - ТОЛЬКО как video (никаких файлов, как просишь)
             if ext in [".jpg",".jpeg",".png",".webp"]:
-                preferred_type = "image"
                 types_to_try = ["image"]
             elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
-                # для всех видео сначала пробуем как video, потом как file (fallback)
-                preferred_type = "video"
-                types_to_try = ["video", "file"]
+                types_to_try = ["video"]  # только video, без fallback на file
             else:
-                preferred_type = "file"
-                types_to_try = ["file", "video"]
+                types_to_try = ["file"]
             
             uploaded = False
             last_err = None
@@ -243,9 +238,12 @@ def send_to_max_multi(file_paths, caption=None):
                         logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} mime={mime} size={os.path.getsize(path)}")
                         r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
                         r.raise_for_status()
-                        upload_url = r.json().get("url")
+                        first_json = r.json()
+                        upload_url = first_json.get("url")
+                        first_token = first_json.get("token")  # для video токен тут!
                         if not upload_url:
                             raise RuntimeError(f"No upload url: {r.text}")
+                        logger.info(f"First response {up_type}: url={upload_url[:100]}... token={str(first_token)[:20]}...")
                         with open(path, "rb") as f:
                             files = {field_name: (base_name, f, mime)}
                             r2 = requests.post(upload_url, files=files, timeout=300)
@@ -254,17 +252,29 @@ def send_to_max_multi(file_paths, caption=None):
                                 logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
                             r2.raise_for_status()
                             text = r2.text.strip()
-                            j = None
-                            token = None
-                            # video CDN возвращает XML <retval>1</retval> - это успех, но токен надо брать из file загрузки
+                            # для video токен из первого запроса, а второй отвечает XML <retval>1</retval>
+                            if up_type == "video":
+                                if "<retval>1</retval>" in text or "<retval>" in text:
+                                    token = first_token
+                                    if not token:
+                                        raise RuntimeError(f"No token in first response for video: {first_json}")
+                                    attachments.append({"type": "video", "payload": {"token": token}})
+                                    logger.info(f"Uploaded {path} as video token={token[:20]}... (from first response)")
+                                    uploaded = True
+                                    break
+                                # если вдруг JSON
+                                try:
+                                    j2 = r2.json()
+                                    token = j2.get("token") or first_token
+                                except:
+                                    token = first_token
+                                if token:
+                                    attachments.append({"type": "video", "payload": {"token": token}})
+                                    uploaded = True
+                                    break
+                            # для file/image токен из второго ответа
                             if "<retval>" in text:
-                                # для video считаем что файл принят, но токен получим через file загрузку
-                                # парсим fileId если есть, иначе считаем что надо пробовать file тип
-                                if up_type == "video":
-                                    logger.info(f"Video CDN returned XML success, will fallback to file upload to get token for video playback")
-                                    raise RuntimeError(f"Video CDN XML success, need file token: {text}")
-                                # если это file и XML - ошибка
-                                raise RuntimeError(f"Unexpected XML response: {text}")
+                                raise RuntimeError(f"Unexpected XML response for {up_type}: {text}")
                             try:
                                 j = r2.json()
                             except Exception as je:
@@ -279,10 +289,8 @@ def send_to_max_multi(file_paths, caption=None):
                                         break
                             if not token:
                                 raise RuntimeError(f"No token: {j}")
-                            # ВАЖНО: если файл mp4, отправляем как video чтобы в MAX был плеер, даже если грузили как file
-                            send_type = "video" if ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"] else up_type
-                            attachments.append({"type": send_type, "payload": {"token": token}})
-                            logger.info(f"Uploaded {path} as {up_type} -> sending as {send_type} token={token[:20]}...")
+                            attachments.append({"type": up_type, "payload": {"token": token}})
+                            logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
                             uploaded = True
                             break
                     except Exception as e:
@@ -294,51 +302,36 @@ def send_to_max_multi(file_paths, caption=None):
             
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
-        # MAX не любит пустой text с файлом, убираем если пусто
-        # пробуем отправить токен как video (плеер) и как file (fallback)
-        # т.к. file токен не всегда принимается как video (503)
-        payloads_to_try = []
-        if attachments:
-            # attachments сейчас содержит 1 элемент с типом video (мы форсим video для mp4)
-            token = attachments[0]["payload"]["token"]
-            orig_type = attachments[0]["type"]
-            # сначала пробуем как video (хотим плеер), потом как file
-            if orig_type == "video":
-                payloads_to_try.append([{"type": "video", "payload": {"token": token}}])
-                payloads_to_try.append([{"type": "file", "payload": {"token": token}}])
-            else:
-                payloads_to_try.append(attachments)
-        else:
+        # отправляем ТОЛЬКО как video, без fallback на file (как ты просишь)
+        if not attachments:
             return
+        
+        # собираем все video токены в один payload для альбома из 10 видео
+        payload = {}
+        if caption:
+            payload["text"] = caption
+        payload["attachments"] = attachments  # до 10 видео в одном сообщении
+        if not payload.get("text"):
+            payload["text"] = " "
 
-        for attach_variant in payloads_to_try:
-            payload = {}
-            if caption:
-                payload["text"] = caption
-            payload["attachments"] = attach_variant
-            if not payload.get("text"):
-                payload["text"] = " "
+        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} video(s)")
 
-            logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: type={attach_variant[0]['type']} token={token[:20]}...")
-            # ретраи на not.ready и на 503 service.unavailable
-            for attempt in range(8):
-                r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
-                if r3.status_code >= 400:
-                    logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | type={attach_variant[0]['type']} attempt={attempt}")
-                    if "not.ready" in r3.text or "not.processed" in r3.text or "service.unavailable" in r3.text or r3.status_code in [502,503,504]:
-                        wait = 3 + attempt*2
-                        logger.info(f"Retrying after {wait}s... ({attempt+1}/8)")
-                        time.sleep(wait)
-                        continue
-                    # если ошибка типа токена - пробуем следующий вариант (video->file)
-                    if attach_variant[0]["type"] == "video":
-                        logger.info("Video send failed, will try as file")
-                        break
-                r3.raise_for_status()
-                logger.info(f"Ушло в MAX: {len(attach_variant)} файлов как {attach_variant[0]['type']} | {caption}")
-                return
-        # если все варианты не прошли
-        raise RuntimeError(f"Не удалось отправить в MAX после всех попыток")
+        # ретраи на not.ready, not.processed, not.owner, attachment.video, attachment.movie
+        # MAX обрабатывает видео после загрузки, иногда 10-20 сек
+        for attempt in range(12):
+            r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
+            if r3.status_code >= 400:
+                txt = r3.text.lower()
+                logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} attempt={attempt}")
+                if any(x in txt for x in ["not.ready", "not.processed", "not.owner", "service.unavailable", "attachment.video", "attachment.movie", "process.attachment"]) or r3.status_code in [404, 502,503,504]:
+                    wait = 5 + attempt*2
+                    logger.info(f"Video not ready yet, waiting {wait}s... ({attempt+1}/12)")
+                    time.sleep(wait)
+                    continue
+            r3.raise_for_status()
+            logger.info(f"Ушло в MAX: {len(attachments)} видео как video | {caption}")
+            return
+        raise RuntimeError(f"Не удалось отправить видео в MAX после всех попыток")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
