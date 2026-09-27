@@ -114,10 +114,22 @@ def download_via_telethon_sync(chat_id, message_id):
                 return None
             
             tmp_dir = tempfile.gettempdir()
-            # keep extension
+            # определяем расширение правильно для фото и видео
             ext = ".mp4"
             if hasattr(msg.file, 'name') and msg.file.name:
                 ext = os.path.splitext(msg.file.name)[1] or ".mp4"
+            elif hasattr(msg.file, 'ext') and msg.file.ext:
+                ext = "." + msg.file.ext.lstrip(".")
+            elif hasattr(msg.file, 'mime_type') and msg.file.mime_type:
+                mime = msg.file.mime_type.lower()
+                if "jpeg" in mime or "jpg" in mime:
+                    ext = ".jpg"
+                elif "png" in mime:
+                    ext = ".png"
+                elif "webp" in mime:
+                    ext = ".webp"
+                elif "mp4" in mime or "quicktime" in mime or "mov" in mime:
+                    ext = ".mp4" if "mp4" in mime else ".mov"
             tmp_path = os.path.join(tmp_dir, f"tele_{message_id}{ext}")
             logger.info(f"Telethon downloading to {tmp_path}")
             path = await client.download_media(msg, file=tmp_path)
@@ -302,36 +314,34 @@ def send_to_max_multi(file_paths, caption=None):
             
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
-        # отправляем ТОЛЬКО как video, без fallback на file (как ты просишь)
         if not attachments:
             return
         
-        # собираем все video токены в один payload для альбома из 10 видео
+        # собираем все токены в один payload - поддерживаем миксы фото+видео
         payload = {}
         if caption:
             payload["text"] = caption
-        payload["attachments"] = attachments  # до 10 видео в одном сообщении
+        payload["attachments"] = attachments  # до 10 вложений (фото+видео) в одном сообщении
         if not payload.get("text"):
             payload["text"] = " "
 
-        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} video(s)")
+        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} attachments ({', '.join([a['type'] for a in attachments])}) caption={caption[:50] if caption else ''}")
 
-        # ретраи на not.ready, not.processed, not.owner, attachment.video, attachment.movie
-        # MAX обрабатывает видео после загрузки, иногда 10-20 сек
-        for attempt in range(12):
+        # ретраи - MAX долго транскодит видео 25МБ, до 90 сек
+        for attempt in range(20):
             r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
             if r3.status_code >= 400:
                 txt = r3.text.lower()
                 logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} attempt={attempt}")
                 if any(x in txt for x in ["not.ready", "not.processed", "not.owner", "service.unavailable", "attachment.video", "attachment.movie", "process.attachment"]) or r3.status_code in [404, 502,503,504]:
-                    wait = 5 + attempt*2
-                    logger.info(f"Video not ready yet, waiting {wait}s... ({attempt+1}/12)")
+                    wait = 10
+                    logger.info(f"Video not ready yet, waiting {wait}s... ({attempt+1}/20)")
                     time.sleep(wait)
                     continue
             r3.raise_for_status()
-            logger.info(f"Ушло в MAX: {len(attachments)} видео как video | {caption}")
+            logger.info(f"Ушло в MAX: {len(attachments)} вложений ({', '.join([a['type'] for a in attachments])}) | {caption[:100] if caption else ''}")
             return
-        raise RuntimeError(f"Не удалось отправить видео в MAX после всех попыток")
+        raise RuntimeError(f"Не удалось отправить в MAX после всех попыток")
     except Exception as e:
         logger.exception(f"Ошибка MAX: {e}")
 
@@ -340,16 +350,36 @@ def flush_album(mgid):
         data = album_buffer.pop(mgid, None)
     if not data:
         return
+    # теперь в data хранятся file_id, а не пути - качаем только сейчас, после сбора всего альбома
+    file_items = data.get("items", [])
+    caption = data.get("caption", "")
+    logger.info(f"Flushing album {mgid}: {len(file_items)} items caption={caption[:100] if caption else ''}")
+    paths = []
     try:
-        send_to_max_multi(data["paths"], data["caption"])
+        for item in file_items:
+            fid = item.get("file_id")
+            cid = item.get("chat_id")
+            mid = item.get("message_id")
+            if not fid:
+                continue
+            try:
+                p = download_tg_file(fid, cid, mid)
+                if p and os.path.exists(p):
+                    paths.append(p)
+                    logger.info(f"Album {mgid} downloaded {p} size={os.path.getsize(p)}")
+            except Exception as e:
+                logger.warning(f"Album {mgid} download failed for {mid}: {e}")
+        logger.info(f"Album {mgid} ready to send: {len(paths)} files")
+        if paths:
+            send_to_max_multi(paths, caption)
     finally:
-        for p in data["paths"]:
+        for p in paths:
             try: os.remove(p)
             except: pass
 
-@bot.channel_post_handler(content_types=['photo','video','document','animation','text'])
+@bot.channel_post_handler(content_types=['photo','video','document','animation','video_note','voice','text'])
 def handle_channel_post(message: Message):
-    logger.info(f"Пост: type={message.content_type} id={message.message_id} chat={message.chat.id} has_video={bool(message.video)} mgid={getattr(message, 'media_group_id', None)}")
+    logger.info(f"Пост: type={message.content_type} id={message.message_id} chat={message.chat.id} has_video={bool(message.video)} has_video_note={bool(getattr(message, 'video_note', None))} mgid={getattr(message, 'media_group_id', None)}")
     try:
         mgid = getattr(message, "media_group_id", None)
         file_id = None
@@ -357,32 +387,38 @@ def handle_channel_post(message: Message):
             file_id = message.photo[-1].file_id
         elif message.video:
             file_id = message.video.file_id
+        elif getattr(message, 'video_note', None):
+            file_id = message.video_note.file_id
+        elif getattr(message, 'voice', None):
+            file_id = message.voice.file_id
         elif message.document:
             file_id = message.document.file_id
         elif message.animation:
             file_id = message.animation.file_id
 
         if mgid:
-            local_path = None
-            if file_id:
-                try:
-                    local_path = download_tg_file(file_id, message.chat.id, message.message_id)
-                except Exception:
-                    local_path = None
+            # для альбома НЕ качаем сразу, а только сохраняем file_id - иначе 10 видео по 45 сек скачивания сломают таймер
             with album_lock:
                 if mgid not in album_buffer:
-                    album_buffer[mgid] = {"paths": [], "caption": "", "timer": None}
-                if local_path:
-                    album_buffer[mgid]["paths"].append(local_path)
+                    album_buffer[mgid] = {"items": [], "caption": "", "timer": None}
+                if file_id:
+                    album_buffer[mgid]["items"].append({
+                        "file_id": file_id,
+                        "chat_id": message.chat.id,
+                        "message_id": message.message_id
+                    })
                 if message.caption:
                     album_buffer[mgid]["caption"] = message.caption
                 if message.text:
                     album_buffer[mgid]["caption"] = message.text
                 if album_buffer[mgid]["timer"]:
                     album_buffer[mgid]["timer"].cancel()
-                t = threading.Timer(3.5, flush_album, args=[mgid])
+                # для 10 видео таймер 12 сек - достаточно чтобы ТГ прислал все 10 частей альбома (они приходят за 1-2 сек)
+                # скачивание начнется только после этого
+                t = threading.Timer(12.0, flush_album, args=[mgid])
                 album_buffer[mgid]["timer"] = t
                 t.start()
+                logger.info(f"Album {mgid} buffered: {len(album_buffer[mgid]['items'])} items, timer reset to 12s")
             return
 
         local_path = None
