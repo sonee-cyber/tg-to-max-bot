@@ -221,12 +221,22 @@ def send_to_max_multi(file_paths, caption=None):
             
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
-        payload = {"text": caption or ""}
+        # MAX не любит пустой text с файлом, убираем если пусто
+        payload = {}
+        if caption:
+            payload["text"] = caption
         if attachments:
             payload["attachments"] = attachments
-        if not payload["text"] and not attachments:
+        if not payload.get("text") and not attachments:
             return
+        # если только файл без текста - добавим пробел чтобы не было пустого
+        if not payload.get("text"):
+            payload["text"] = " "
+        
+        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {payload}")
         r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
+        if r3.status_code >= 400:
+            logger.warning(f"MAX send failed {r3.status_code}: {r3.text[:2000]} | payload={payload}")
         r3.raise_for_status()
         logger.info(f"Ушло в MAX: {len(attachments)} файлов | {caption}")
     except Exception as e:
