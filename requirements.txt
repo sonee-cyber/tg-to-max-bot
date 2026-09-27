@@ -4,3 +4,4 @@ python-dotenv
 pyrogram
 tgcrypto
 telethon
+imageio-ffmpeg
