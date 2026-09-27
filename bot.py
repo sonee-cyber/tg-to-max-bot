@@ -1,6 +1,5 @@
 import os, tempfile, logging, time, requests, telebot, threading, asyncio
 from telebot.types import Message
-from telebot.apihelper import ApiTelegramException
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
@@ -15,92 +14,110 @@ if "railway.internal" in LOCAL_API:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logger.info(f"ENV: TG=set MAX=set LOCAL={LOCAL_API} API_ID={'set' if API_ID else 'MISSING'}")
+logger.info(f"ENV: TG={'set' if TG_BOT_TOKEN else 'MISS'} MAX={'set' if MAX_BOT_TOKEN else 'MISS'} LOCAL={LOCAL_API} API_ID={'set' if API_ID else 'MISSING'}")
 
 if not TG_BOT_TOKEN:
     raise SystemExit("TG_BOT_TOKEN missing")
 
 bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
 
-# Pyrogram client for big files (>20MB) - bypass Bot API file server
-pyro_app = None
-if API_ID and API_HASH:
-    try:
-        from pyrogram import Client
-        pyro_app = Client("bot_session", api_id=int(API_ID), api_hash=API_HASH, bot_token=TG_BOT_TOKEN, in_memory=True)
-        logger.info("Pyrogram client created for direct MTProto download")
-    except Exception as e:
-        logger.warning(f"Pyrogram not available: {e}")
-
 album_buffer = {}
 album_lock = threading.Lock()
 
-async def download_via_pyrogram(chat_id, message_id):
-    if not pyro_app:
+def download_via_telethon_sync(chat_id, message_id):
+    if not API_ID or not API_HASH:
+        logger.warning("No API_ID/HASH for telethon")
         return None
-    try:
-        async with pyro_app:
-            msg = await pyro_app.get_messages(chat_id, message_id)
-            if not msg or (not msg.video and not msg.document and not msg.photo and not msg.animation):
-                logger.warning(f"Pyrogram: no media in msg {message_id}")
+    async def _run():
+        from telethon import TelegramClient
+        # use temp session file per message to avoid lock
+        sess_name = f"/tmp/bot_sess_{message_id}_{int(time.time())}"
+        client = TelegramClient(sess_name, int(API_ID), API_HASH)
+        try:
+            await client.start(bot_token=TG_BOT_TOKEN)
+            logger.info(f"Telethon started, getting entity {chat_id}")
+            # for private channel, need to get dialogs first to cache?
+            # Try get_entity directly
+            try:
+                entity = await client.get_entity(chat_id)
+            except Exception as e:
+                logger.warning(f"get_entity {chat_id} failed: {e}, trying get_dialogs")
+                # populate dialogs
+                async for d in client.iter_dialogs():
+                    if d.id == chat_id or getattr(d.entity, 'id', None) == abs(chat_id):
+                        entity = d.entity
+                        break
+                else:
+                    # try with PeerChannel
+                    from telethon.tl.types import PeerChannel
+                    # -1004241800990 -> channel id 4241800990
+                    raw_id = int(str(chat_id).replace("-100", ""))
+                    entity = await client.get_entity(PeerChannel(raw_id))
+            
+            logger.info(f"Got entity {entity}, getting msg {message_id}")
+            msg = await client.get_messages(entity, ids=message_id)
+            if not msg:
+                logger.warning(f"Telethon: msg {message_id} not found")
                 return None
+            if not msg.media:
+                logger.warning(f"Telethon: msg {message_id} has no media")
+                return None
+            
             tmp_dir = tempfile.gettempdir()
+            # keep extension
             ext = ".mp4"
-            if msg.video and msg.video.file_name:
-                ext = os.path.splitext(msg.video.file_name)[1] or ".mp4"
-            elif msg.document and msg.document.file_name:
-                ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
-            tmp_path = os.path.join(tmp_dir, f"pyro_{message_id}{ext}")
-            path = await pyro_app.download_media(msg, file_name=tmp_path)
-            logger.info(f"Pyrogram downloaded: {path} size={os.path.getsize(path) if path and os.path.exists(path) else 0}")
+            if hasattr(msg.file, 'name') and msg.file.name:
+                ext = os.path.splitext(msg.file.name)[1] or ".mp4"
+            tmp_path = os.path.join(tmp_dir, f"tele_{message_id}{ext}")
+            logger.info(f"Telethon downloading to {tmp_path}")
+            path = await client.download_media(msg, file=tmp_path)
+            logger.info(f"Telethon downloaded: {path} size={os.path.getsize(path) if path and os.path.exists(path) else 0}")
             return path
-    except Exception as e:
-        logger.exception(f"Pyrogram download failed: {e}")
-        return None
+        finally:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            # cleanup session files
+            try:
+                for f in [sess_name + ".session", sess_name + ".session-journal"]:
+                    if os.path.exists(f):
+                        os.remove(f)
+            except:
+                pass
 
-def download_via_pyrogram_sync(chat_id, message_id):
+    # run in fresh loop to avoid "different loop" error
     try:
-        return asyncio.run(download_via_pyrogram(chat_id, message_id))
-    except RuntimeError:
-        # if loop already running
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(download_via_pyrogram(chat_id, message_id))
+        result = loop.run_until_complete(_run())
+        loop.close()
+        return result
+    except Exception as e:
+        logger.exception(f"Telethon download failed: {e}")
+        return None
 
 def download_tg_file(file_id: str, chat_id=None, message_id=None):
-    # Try direct MTProto first for big files if we have chat_id
-    if chat_id and message_id and pyro_app:
-        logger.info(f"Trying Pyrogram direct download for msg {message_id} in {chat_id}")
-        path = download_via_pyrogram_sync(chat_id, message_id)
+    # 1. Try Telethon first for any file if we have chat_id - it bypasses 20MB limit and 404
+    if chat_id and message_id:
+        logger.info(f"Trying Telethon direct download for msg {message_id} in {chat_id}")
+        path = download_via_telethon_sync(chat_id, message_id)
         if path and os.path.exists(path) and os.path.getsize(path) > 0:
             return path
+        logger.warning("Telethon failed, falling back to Bot API")
 
     try:
         r = requests.get(f"{LOCAL_API}/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
         data = r.json()
         if not data.get("ok"):
-            if "file is too big" in data.get("description","").lower():
-                # fallback to pyrogram
-                if chat_id and message_id and pyro_app:
-                    return download_via_pyrogram_sync(chat_id, message_id)
-                logger.warning(f"File {file_id} >20MB and no pyrogram fallback")
-                return None
-            raise RuntimeError(data)
+            logger.warning(f"getFile failed: {data}")
+            return None
         fp = data["result"]["file_path"]
         logger.info(f"getFile returned: {fp}")
         ext = os.path.splitext(fp)[-1] or ".jpg"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.close()
 
-        # Try local disk (if volume exists)
-        for dp in [fp, "/" + fp.lstrip("/"), fp.lstrip("/")]:
-            if os.path.exists(dp) and os.path.getsize(dp) > 0:
-                import shutil
-                shutil.copyfile(dp, tmp.name)
-                logger.info(f"Copied from disk {dp}")
-                return tmp.name
-
-        # Try http from local api
         candidates = []
         norm = fp.lstrip("/")
         if norm.startswith("var/lib/telegram-bot-api/"):
@@ -111,7 +128,7 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
         candidates += [fp.lstrip("/"), fp]
         
         bases = [LOCAL_API.rstrip("/")]
-        for attempt in range(3):
+        for attempt in range(2):
             for base in bases:
                 for cand in candidates:
                     url = f"{base}/file/bot{TG_BOT_TOKEN}/{cand}".replace(f"/bot{TG_BOT_TOKEN}//", f"/bot{TG_BOT_TOKEN}/")
@@ -128,19 +145,11 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
                     except Exception as e:
                         logger.warning(f"Fail {url}: {e}")
                         continue
-            time.sleep(3)
-
-        # last resort pyrogram
-        if chat_id and message_id and pyro_app:
-            logger.info("All http failed, trying Pyrogram final")
-            return download_via_pyrogram_sync(chat_id, message_id)
-
+            time.sleep(2)
         return None
     except Exception as e:
         logger.exception(f"download_tg_file error: {e}")
-        if chat_id and message_id and pyro_app:
-            return download_via_pyrogram_sync(chat_id, message_id)
-        raise
+        return None
 
 def send_to_max_multi(file_paths, caption=None):
     if isinstance(file_paths, str):
