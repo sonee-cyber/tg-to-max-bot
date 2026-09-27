@@ -163,23 +163,54 @@ def send_to_max_multi(file_paths, caption=None):
     try:
         for path in file_paths:
             ext = os.path.splitext(path)[1].lower()
-            up_type = "image" if ext in [".jpg",".jpeg",".png",".webp"] else "video" if ext in [".mp4",".mov",".avi",".mkv"] else "file"
-            r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
-            r.raise_for_status()
-            upload_url = r.json().get("url")
-            with open(path, "rb") as f:
-                r2 = requests.post(upload_url, files={"data": f}, timeout=180)
-                r2.raise_for_status()
-                j = r2.json()
-            token = j.get("token")
-            if not token and "photos" in j:
-                for v in j["photos"].values():
-                    if isinstance(v, dict) and "token" in v:
-                        token = v["token"]
-                        break
-            if not token:
-                raise RuntimeError(f"No token: {j}")
-            attachments.append({"type": up_type, "payload": {"token": token}})
+            # MAX часто не принимает .MOV как video -> пробуем как file
+            preferred_type = "image" if ext in [".jpg",".jpeg",".png",".webp"] else "video" if ext in [".mp4",".avi",".mkv"] else "file"
+            # для .mov сразу пробуем file, но оставим fallback
+            if ext == ".mov":
+                preferred_type = "file"
+            
+            types_to_try = [preferred_type]
+            if preferred_type == "file" and ext in [".mov", ".mp4"]:
+                types_to_try.append("video")
+            if preferred_type == "video":
+                types_to_try.append("file")
+            
+            uploaded = False
+            last_err = None
+            for up_type in types_to_try:
+                try:
+                    logger.info(f"Uploading {path} as {up_type} (ext={ext} size={os.path.getsize(path)})")
+                    r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
+                    r.raise_for_status()
+                    upload_url = r.json().get("url")
+                    if not upload_url:
+                        raise RuntimeError(f"No upload url: {r.text}")
+                    with open(path, "rb") as f:
+                        r2 = requests.post(upload_url, files={"data": f}, timeout=300)
+                        # логируем тело ошибки если 400
+                        if r2.status_code >= 400:
+                            logger.warning(f"Upload {up_type} failed {r2.status_code}: {r2.text[:500]}")
+                        r2.raise_for_status()
+                        j = r2.json()
+                    token = j.get("token")
+                    if not token and "photos" in j:
+                        for v in j["photos"].values():
+                            if isinstance(v, dict) and "token" in v:
+                                token = v["token"]
+                                break
+                    if not token:
+                        raise RuntimeError(f"No token: {j}")
+                    attachments.append({"type": up_type, "payload": {"token": token}})
+                    logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
+                    uploaded = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(f"Upload as {up_type} failed: {e}, trying next")
+                    continue
+            
+            if not uploaded:
+                raise last_err or RuntimeError("All upload types failed")
         payload = {"text": caption or ""}
         if attachments:
             payload["attachments"] = attachments
