@@ -314,18 +314,20 @@ def send_to_max_multi(file_paths, caption=None):
             
             if not uploaded:
                 raise last_err or RuntimeError("All upload types failed")
-        if not attachments:
+        if not attachments and not caption:
+            logger.info("Nothing to send (no attachments and no text)")
             return
         
-        # собираем все токены в один payload - поддерживаем миксы фото+видео
+        # собираем все токены в один payload - поддерживаем миксы фото+видео и просто текст
         payload = {}
         if caption:
             payload["text"] = caption
-        payload["attachments"] = attachments  # до 10 вложений (фото+видео) в одном сообщении
+        if attachments:
+            payload["attachments"] = attachments  # до 10 вложений (фото+видео) в одном сообщении
         if not payload.get("text"):
             payload["text"] = " "
 
-        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} attachments ({', '.join([a['type'] for a in attachments])}) caption={caption[:50] if caption else ''}")
+        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} attachments ({', '.join([a['type'] for a in attachments]) if attachments else 'text only'}) caption={caption[:50] if caption else ''}")
 
         # ретраи - MAX долго транскодит видео 25МБ, до 90 сек
         for attempt in range(20):
