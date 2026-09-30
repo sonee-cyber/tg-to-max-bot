@@ -71,60 +71,150 @@ album_buffer = {}
 album_lock = threading.Lock()
 
 def tg_entities_to_max_markdown(text, entities):
-    """Конвертит ТГ форматирование (bold, italic, url, text_link) в MAX markdown"""
+    """Конвертит ТГ форматирование в MAX markdown с корректным UTF-16 offset"""
     if not text:
         return "", None
     if not entities:
         return text, None
-    try:
-        sorted_ents = sorted(entities, key=lambda e: getattr(e, 'offset', 0), reverse=True)
-    except:
+
+    def utf16_to_py_index(s, utf16_offset):
+        count = 0
+        for i, ch in enumerate(s):
+            if count >= utf16_offset:
+                return i
+            units = 2 if ord(ch) > 0xFFFF else 1
+            if count < utf16_offset < count + units:
+                return i
+            count += units
+        return len(s)
+
+    py_ents = []
+    for ent in entities:
+        try:
+            off = getattr(ent, 'offset', 0)
+            leng = getattr(ent, 'length', 0)
+            etype = getattr(ent, 'type', '')
+            url = getattr(ent, 'url', '') or ''
+            py_start = utf16_to_py_index(text, off)
+            py_end = utf16_to_py_index(text, off + leng)
+            py_start = max(0, min(py_start, len(text)))
+            py_end = max(0, min(py_end, len(text)))
+            if py_start >= py_end:
+                continue
+            py_ents.append({
+                'py_start': py_start,
+                'py_end': py_end,
+                'type': etype,
+                'url': url,
+                'orig': text[py_start:py_end],
+                'length': py_end - py_start
+            })
+        except:
+            continue
+
+    if not py_ents:
         return text, None
 
-    result = text
+    from collections import defaultdict
+    opens = defaultdict(list)
+    closes = defaultdict(list)
     has_fmt = False
-    for ent in sorted_ents:
-        try:
-            offset = getattr(ent, 'offset', 0)
-            length = getattr(ent, 'length', 0)
-            etype = getattr(ent, 'type', '')
-            if offset < 0 or offset > len(result):
-                continue
-            if offset + length > len(result):
-                length = len(result) - offset
-            ent_text = result[offset:offset+length]
+    bq_ranges = []
 
-            if etype == 'bold':
-                result = result[:offset] + f"**{ent_text}**" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'italic':
-                result = result[:offset] + f"_{ent_text}_" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'underline':
-                result = result[:offset] + f"++{ent_text}++" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'strikethrough':
-                result = result[:offset] + f"~~{ent_text}~~" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'code':
-                result = result[:offset] + f"`{ent_text}`" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'pre':
-                result = result[:offset] + f"```\n{ent_text}\n```" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'url':
-                result = result[:offset] + f"[{ent_text}]({ent_text})" + result[offset+length:]
-                has_fmt = True
-            elif etype == 'text_link':
-                url = getattr(ent, 'url', '')
-                if url:
-                    safe_text = ent_text.replace(']', '\\]').replace('[', '\\[')
-                    result = result[:offset] + f"[{safe_text}]({url})" + result[offset+length:]
-                    has_fmt = True
-        except Exception as e:
-            logger.warning(f"Entity convert failed {etype}: {e}")
-            continue
-    return result, "markdown" if has_fmt else None
+    for ent in py_ents:
+        s = ent['py_start']
+        e = ent['py_end']
+        orig = ent['orig']
+        url = ent['url']
+        etype = ent['type']
+        leng = ent['length']
+
+        if etype == 'bold':
+            opens[s].append(('**', leng))
+            closes[e].append(('**', leng))
+            has_fmt = True
+        elif etype == 'italic':
+            opens[s].append(('_', leng))
+            closes[e].append(('_', leng))
+            has_fmt = True
+        elif etype == 'underline':
+            opens[s].append(('++', leng))
+            closes[e].append(('++', leng))
+            has_fmt = True
+        elif etype == 'strikethrough':
+            opens[s].append(('~~', leng))
+            closes[e].append(('~~', leng))
+            has_fmt = True
+        elif etype == 'code':
+            opens[s].append(('`', leng))
+            closes[e].append(('`', leng))
+            has_fmt = True
+        elif etype == 'pre':
+            opens[s].append(('```\n', leng))
+            closes[e].append(('\n```', leng))
+            has_fmt = True
+        elif etype == 'url':
+            opens[s].append(('[', leng))
+            closes[e].append((f']({orig})', leng))
+            has_fmt = True
+        elif etype == 'text_link' and url:
+            opens[s].append(('[', leng))
+            closes[e].append((f']({url})', leng))
+            has_fmt = True
+        elif etype in ('blockquote', 'expandable_blockquote'):
+            bq_ranges.append((s, e))
+            has_fmt = True
+        elif etype == 'spoiler':
+            opens[s].append(('||', leng))
+            closes[e].append(('||', leng))
+            has_fmt = True
+
+    result_parts = []
+    for i in range(len(text) + 1):
+        if i in closes:
+            for marker, leng in sorted(closes[i], key=lambda x: x[1]):
+                result_parts.append(marker)
+        if i < len(text):
+            if i in opens:
+                for marker, leng in sorted(opens[i], key=lambda x: -x[1]):
+                    result_parts.append(marker)
+            ch = text[i]
+            inside_link = False
+            for ent in py_ents:
+                if ent['type'] in ('url', 'text_link') and ent['py_start'] <= i < ent['py_end']:
+                    inside_link = True
+                    break
+            if inside_link and ch in (']', '['):
+                result_parts.append('\\' + ch)
+            else:
+                result_parts.append(ch)
+
+    inline_text = ''.join(result_parts)
+
+    if bq_ranges:
+        orig_lines = text.split('\n')
+        line_offsets = []
+        off = 0
+        for line in orig_lines:
+            line_offsets.append((off, off + len(line)))
+            off += len(line) + 1
+        bq_line_idxs = set()
+        for bq_s, bq_e in bq_ranges:
+            for idx, (ls, le) in enumerate(line_offsets):
+                if ls < bq_e and le > bq_s:
+                    bq_line_idxs.add(idx)
+        inline_lines = inline_text.split('\n')
+        for idx in bq_line_idxs:
+            if idx < len(inline_lines):
+                line = inline_lines[idx]
+                if line.strip() == '':
+                    inline_lines[idx] = '>'
+                else:
+                    if not line.lstrip().startswith('>'):
+                        inline_lines[idx] = f'> {line}'
+        inline_text = '\n'.join(inline_lines)
+
+    return inline_text, "markdown" if has_fmt else None
 
 
 def download_via_telethon_sync(chat_id, message_id):
