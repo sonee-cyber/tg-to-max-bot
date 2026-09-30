@@ -23,8 +23,6 @@ def convert_to_mp4_if_needed(src_path):
             logger.info(f"Using imageio-ffmpeg: {ffmpeg_exe}")
         except:
             pass
-        # ВАЖНО: -pix_fmt yuv420p -profile:v high для совместимости с MAX плеером
-        # иначе HEVC из телеги дает yuv420p10le и MAX не ест
         cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-pix_fmt", "yuv420p", "-profile:v", "high", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"] + extra_vf + [dst_path]
         logger.info(f"Converting {src_path} -> {dst_path} via ffmpeg...")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -32,7 +30,6 @@ def convert_to_mp4_if_needed(src_path):
             orig = os.path.getsize(src_path)
             new = os.path.getsize(dst_path)
             logger.info(f"Converted OK: {orig} -> {new} bytes ({orig/new:.1f}x)")
-            # удаляем оригинал чтобы не забивать диск
             try:
                 os.remove(src_path)
             except:
@@ -40,7 +37,6 @@ def convert_to_mp4_if_needed(src_path):
             return dst_path
         else:
             logger.warning(f"ffmpeg failed code={result.returncode}: {result.stderr[:2000]}")
-            # удаляем битый dst
             try:
                 if os.path.exists(dst_path):
                     os.remove(dst_path)
@@ -74,33 +70,84 @@ bot = telebot.TeleBot(TG_BOT_TOKEN, threaded=False)
 album_buffer = {}
 album_lock = threading.Lock()
 
+def tg_entities_to_max_markdown(text, entities):
+    """Конвертит ТГ форматирование (bold, italic, url, text_link) в MAX markdown"""
+    if not text:
+        return "", None
+    if not entities:
+        return text, None
+    try:
+        sorted_ents = sorted(entities, key=lambda e: getattr(e, 'offset', 0), reverse=True)
+    except:
+        return text, None
+
+    result = text
+    has_fmt = False
+    for ent in sorted_ents:
+        try:
+            offset = getattr(ent, 'offset', 0)
+            length = getattr(ent, 'length', 0)
+            etype = getattr(ent, 'type', '')
+            if offset < 0 or offset > len(result):
+                continue
+            if offset + length > len(result):
+                length = len(result) - offset
+            ent_text = result[offset:offset+length]
+
+            if etype == 'bold':
+                result = result[:offset] + f"**{ent_text}**" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'italic':
+                result = result[:offset] + f"_{ent_text}_" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'underline':
+                result = result[:offset] + f"++{ent_text}++" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'strikethrough':
+                result = result[:offset] + f"~~{ent_text}~~" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'code':
+                result = result[:offset] + f"`{ent_text}`" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'pre':
+                result = result[:offset] + f"```\n{ent_text}\n```" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'url':
+                result = result[:offset] + f"[{ent_text}]({ent_text})" + result[offset+length:]
+                has_fmt = True
+            elif etype == 'text_link':
+                url = getattr(ent, 'url', '')
+                if url:
+                    safe_text = ent_text.replace(']', '\\]').replace('[', '\\[')
+                    result = result[:offset] + f"[{safe_text}]({url})" + result[offset+length:]
+                    has_fmt = True
+        except Exception as e:
+            logger.warning(f"Entity convert failed {etype}: {e}")
+            continue
+    return result, "markdown" if has_fmt else None
+
+
 def download_via_telethon_sync(chat_id, message_id):
     if not API_ID or not API_HASH:
         logger.warning("No API_ID/HASH for telethon")
         return None
     async def _run():
         from telethon import TelegramClient
-        # use temp session file per message to avoid lock
         sess_name = f"/tmp/bot_sess_{message_id}_{int(time.time())}"
         client = TelegramClient(sess_name, int(API_ID), API_HASH)
         try:
             await client.start(bot_token=TG_BOT_TOKEN)
             logger.info(f"Telethon started, getting entity {chat_id}")
-            # for private channel, need to get dialogs first to cache?
-            # Try get_entity directly
             try:
                 entity = await client.get_entity(chat_id)
             except Exception as e:
                 logger.warning(f"get_entity {chat_id} failed: {e}, trying get_dialogs")
-                # populate dialogs
                 async for d in client.iter_dialogs():
                     if d.id == chat_id or getattr(d.entity, 'id', None) == abs(chat_id):
                         entity = d.entity
                         break
                 else:
-                    # try with PeerChannel
                     from telethon.tl.types import PeerChannel
-                    # -1004241800990 -> channel id 4241800990
                     raw_id = int(str(chat_id).replace("-100", ""))
                     entity = await client.get_entity(PeerChannel(raw_id))
             
@@ -114,7 +161,6 @@ def download_via_telethon_sync(chat_id, message_id):
                 return None
             
             tmp_dir = tempfile.gettempdir()
-            # определяем расширение правильно для фото и видео
             ext = ".mp4"
             if hasattr(msg.file, 'name') and msg.file.name:
                 ext = os.path.splitext(msg.file.name)[1] or ".mp4"
@@ -140,7 +186,6 @@ def download_via_telethon_sync(chat_id, message_id):
                 await client.disconnect()
             except:
                 pass
-            # cleanup session files
             try:
                 for f in [sess_name + ".session", sess_name + ".session-journal"]:
                     if os.path.exists(f):
@@ -148,7 +193,6 @@ def download_via_telethon_sync(chat_id, message_id):
             except:
                 pass
 
-    # run in fresh loop to avoid "different loop" error
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -160,12 +204,10 @@ def download_via_telethon_sync(chat_id, message_id):
         return None
 
 def download_tg_file(file_id: str, chat_id=None, message_id=None):
-    # 1. Try Telethon first for any file if we have chat_id - it bypasses 20MB limit and 404
     if chat_id and message_id:
         logger.info(f"Trying Telethon direct download for msg {message_id} in {chat_id}")
         path = download_via_telethon_sync(chat_id, message_id)
         if path and os.path.exists(path) and os.path.getsize(path) > 0:
-            # конвертим MOV -> mp4 H264 для MAX video
             path = convert_to_mp4_if_needed(path)
             return path
         logger.warning("Telethon failed, falling back to Bot API")
@@ -215,7 +257,7 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
         logger.exception(f"download_tg_file error: {e}")
         return None
 
-def send_to_max_multi(file_paths, caption=None):
+def send_to_max_multi(file_paths, caption=None, fmt=None):
     if isinstance(file_paths, str):
         file_paths = [file_paths]
     file_paths = [p for p in (file_paths or []) if p and os.path.exists(p)]
@@ -227,19 +269,16 @@ def send_to_max_multi(file_paths, caption=None):
     try:
         for path in file_paths:
             ext = os.path.splitext(path)[1].lower()
-            # для видео - ТОЛЬКО как video (никаких файлов, как просишь)
             if ext in [".jpg",".jpeg",".png",".webp"]:
                 types_to_try = ["image"]
             elif ext in [".mp4", ".mov", ".avi", ".mkv", ".webm"]:
-                types_to_try = ["video"]  # только video, без fallback на file
+                types_to_try = ["video"]
             else:
                 types_to_try = ["file"]
             
             uploaded = False
             last_err = None
-            # для CDN важно имя файла с маленькой буквы и правильное расширение
             base_name = os.path.basename(path)
-            # .MOV -> .mp4 для совместимости CDN omub.okcdn.ru
             if ext == ".mov":
                 base_name = os.path.splitext(base_name)[0] + ".mp4"
             
@@ -252,7 +291,7 @@ def send_to_max_multi(file_paths, caption=None):
                         r.raise_for_status()
                         first_json = r.json()
                         upload_url = first_json.get("url")
-                        first_token = first_json.get("token")  # для video токен тут!
+                        first_token = first_json.get("token")
                         if not upload_url:
                             raise RuntimeError(f"No upload url: {r.text}")
                         logger.info(f"First response {up_type}: url={upload_url[:100]}... token={str(first_token)[:20]}...")
@@ -264,7 +303,6 @@ def send_to_max_multi(file_paths, caption=None):
                                 logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
                             r2.raise_for_status()
                             text = r2.text.strip()
-                            # для video токен из первого запроса, а второй отвечает XML <retval>1</retval>
                             if up_type == "video":
                                 if "<retval>1</retval>" in text or "<retval>" in text:
                                     token = first_token
@@ -274,7 +312,6 @@ def send_to_max_multi(file_paths, caption=None):
                                     logger.info(f"Uploaded {path} as video token={token[:20]}... (from first response)")
                                     uploaded = True
                                     break
-                                # если вдруг JSON
                                 try:
                                     j2 = r2.json()
                                     token = j2.get("token") or first_token
@@ -284,7 +321,6 @@ def send_to_max_multi(file_paths, caption=None):
                                     attachments.append({"type": "video", "payload": {"token": token}})
                                     uploaded = True
                                     break
-                            # для file/image токен из второго ответа
                             if "<retval>" in text:
                                 raise RuntimeError(f"Unexpected XML response for {up_type}: {text}")
                             try:
@@ -318,18 +354,18 @@ def send_to_max_multi(file_paths, caption=None):
             logger.info("Nothing to send (no attachments and no text)")
             return
         
-        # собираем все токены в один payload - поддерживаем миксы фото+видео и просто текст
         payload = {}
         if caption:
             payload["text"] = caption
         if attachments:
-            payload["attachments"] = attachments  # до 10 вложений (фото+видео) в одном сообщении
+            payload["attachments"] = attachments
         if not payload.get("text"):
             payload["text"] = " "
+        if fmt:
+            payload["format"] = fmt
 
-        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} attachments ({', '.join([a['type'] for a in attachments]) if attachments else 'text only'}) caption={caption[:50] if caption else ''}")
+        logger.info(f"Sending to MAX chat {MAX_CHAT_ID}: {len(attachments)} attachments ({', '.join([a['type'] for a in attachments]) if attachments else 'text only'}) caption={caption[:50] if caption else ''} fmt={fmt}")
 
-        # ретраи - MAX долго транскодит видео 25МБ, до 90 сек
         for attempt in range(20):
             r3 = requests.post(f"{base}/messages", params={"chat_id": int(MAX_CHAT_ID)}, headers=headers, json=payload, timeout=30)
             if r3.status_code >= 400:
@@ -352,9 +388,9 @@ def flush_album(mgid):
         data = album_buffer.pop(mgid, None)
     if not data:
         return
-    # теперь в data хранятся file_id, а не пути - качаем только сейчас, после сбора всего альбома
     file_items = data.get("items", [])
     caption = data.get("caption", "")
+    caption_entities = data.get("caption_entities")
     logger.info(f"Flushing album {mgid}: {len(file_items)} items caption={caption[:100] if caption else ''}")
     paths = []
     try:
@@ -372,8 +408,9 @@ def flush_album(mgid):
             except Exception as e:
                 logger.warning(f"Album {mgid} download failed for {mid}: {e}")
         logger.info(f"Album {mgid} ready to send: {len(paths)} files")
-        if paths:
-            send_to_max_multi(paths, caption)
+        if paths or caption:
+            formatted_caption, fmt = tg_entities_to_max_markdown(caption, caption_entities)
+            send_to_max_multi(paths, formatted_caption, fmt=fmt)
     finally:
         for p in paths:
             try: os.remove(p)
@@ -399,10 +436,9 @@ def handle_channel_post(message: Message):
             file_id = message.animation.file_id
 
         if mgid:
-            # для альбома НЕ качаем сразу, а только сохраняем file_id - иначе 10 видео по 45 сек скачивания сломают таймер
             with album_lock:
                 if mgid not in album_buffer:
-                    album_buffer[mgid] = {"items": [], "caption": "", "timer": None}
+                    album_buffer[mgid] = {"items": [], "caption": "", "caption_entities": None, "timer": None}
                 if file_id:
                     album_buffer[mgid]["items"].append({
                         "file_id": file_id,
@@ -411,12 +447,12 @@ def handle_channel_post(message: Message):
                     })
                 if message.caption:
                     album_buffer[mgid]["caption"] = message.caption
+                    album_buffer[mgid]["caption_entities"] = message.caption_entities
                 if message.text:
                     album_buffer[mgid]["caption"] = message.text
+                    album_buffer[mgid]["caption_entities"] = message.entities
                 if album_buffer[mgid]["timer"]:
                     album_buffer[mgid]["timer"].cancel()
-                # для 10 видео таймер 12 сек - достаточно чтобы ТГ прислал все 10 частей альбома (они приходят за 1-2 сек)
-                # скачивание начнется только после этого
                 t = threading.Timer(12.0, flush_album, args=[mgid])
                 album_buffer[mgid]["timer"] = t
                 t.start()
@@ -430,9 +466,11 @@ def handle_channel_post(message: Message):
             except Exception as e:
                 logger.exception(f"Не удалось скачать файл")
 
-        text_to_send = message.caption or message.text or ""
+        raw_text = message.caption or message.text or ""
+        raw_entities = message.caption_entities if message.caption else message.entities
+        text_to_send, fmt = tg_entities_to_max_markdown(raw_text, raw_entities)
         try:
-            send_to_max_multi(local_path, text_to_send)
+            send_to_max_multi(local_path, text_to_send, fmt=fmt)
         finally:
             if local_path and os.path.exists(local_path):
                 try: os.remove(local_path)
