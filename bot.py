@@ -374,67 +374,72 @@ def send_to_max_multi(file_paths, caption=None, fmt=None):
             
             for up_type in types_to_try:
                 for field_name in ["data", "file"]:
-                    try:
-                        mime = "video/mp4" if up_type == "video" else "application/octet-stream"
-                        logger.info(f"Uploading {path} as {up_type} field={field_name} name={base_name} mime={mime} size={os.path.getsize(path)}")
-                        r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
-                        r.raise_for_status()
-                        first_json = r.json()
-                        upload_url = first_json.get("url")
-                        first_token = first_json.get("token")
-                        if not upload_url:
-                            raise RuntimeError(f"No upload url: {r.text}")
-                        logger.info(f"First response {up_type}: url={upload_url[:100]}... token={str(first_token)[:20]}...")
-                        with open(path, "rb") as f:
-                            files = {field_name: (base_name, f, mime)}
-                            r2 = requests.post(upload_url, files=files, timeout=300)
-                            logger.info(f"Upload response {up_type}/{field_name}: status={r2.status_code} text={r2.text[:2000]}")
-                            if r2.status_code >= 400:
-                                logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
-                            r2.raise_for_status()
-                            text = r2.text.strip()
-                            if up_type == "video":
-                                if "<retval>1</retval>" in text or "<retval>" in text:
-                                    token = first_token
-                                    if not token:
-                                        raise RuntimeError(f"No token in first response for video: {first_json}")
-                                    attachments.append({"type": "video", "payload": {"token": token}})
-                                    logger.info(f"Uploaded {path} as video token={token[:20]}... (from first response)")
-                                    uploaded = True
-                                    break
-                                try:
-                                    j2 = r2.json()
-                                    token = j2.get("token") or first_token
-                                except:
-                                    token = first_token
-                                if token:
-                                    attachments.append({"type": "video", "payload": {"token": token}})
-                                    uploaded = True
-                                    break
-                            if "<retval>" in text:
-                                raise RuntimeError(f"Unexpected XML response for {up_type}: {text}")
-                            try:
-                                j = r2.json()
-                            except Exception as je:
-                                logger.warning(f"JSON parse failed for {up_type}/{field_name}: {je} raw={text[:2000]}")
-                                raise
-                            
-                            token = j.get("token") if j else None
-                            if not token and j and "photos" in j:
-                                for v in j["photos"].values():
-                                    if isinstance(v, dict) and "token" in v:
-                                        token = v["token"]
+                    for upload_attempt in range(3):
+                        try:
+                            mime = "video/mp4" if up_type == "video" else "application/octet-stream"
+                            size_mb = os.path.getsize(path) / (1024*1024)
+                            logger.info(f"Uploading {path} as {up_type} field={field_name} attempt={upload_attempt+1}/3 name={base_name} mime={mime} size={size_mb:.1f}MB")
+                            r = requests.post(f"{base}/uploads", params={"type": up_type}, headers=headers, timeout=30)
+                            r.raise_for_status()
+                            first_json = r.json()
+                            upload_url = first_json.get("url")
+                            first_token = first_json.get("token")
+                            if not upload_url:
+                                raise RuntimeError(f"No upload url: {r.text}")
+                            logger.info(f"First response {up_type}: url={upload_url[:100]}... token={str(first_token)[:20]}...")
+                            with open(path, "rb") as f:
+                                files = {field_name: (base_name, f, mime)}
+                                r2 = requests.post(upload_url, files=files, timeout=600)
+                                logger.info(f"Upload response {up_type}/{field_name}: status={r2.status_code} text={r2.text[:2000]}")
+                                if r2.status_code >= 400:
+                                    logger.warning(f"Upload {up_type}/{field_name} failed {r2.status_code}: {r2.text[:800]}")
+                                r2.raise_for_status()
+                                text = r2.text.strip()
+                                if up_type == "video":
+                                    if "<retval>1</retval>" in text or "<retval>" in text:
+                                        token = first_token
+                                        if not token:
+                                            raise RuntimeError(f"No token in first response for video: {first_json}")
+                                        attachments.append({"type": "video", "payload": {"token": token}})
+                                        logger.info(f"Uploaded {path} as video token={token[:20]}... (from first response)")
+                                        uploaded = True
                                         break
-                            if not token:
-                                raise RuntimeError(f"No token: {j}")
-                            attachments.append({"type": up_type, "payload": {"token": token}})
-                            logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
-                            uploaded = True
-                            break
-                    except Exception as e:
-                        last_err = e
-                        logger.warning(f"Upload as {up_type}/{field_name} failed: {e}")
-                        continue
+                                    try:
+                                        j2 = r2.json()
+                                        token = j2.get("token") or first_token
+                                    except:
+                                        token = first_token
+                                    if token:
+                                        attachments.append({"type": "video", "payload": {"token": token}})
+                                        uploaded = True
+                                        break
+                                if "<retval>" in text:
+                                    raise RuntimeError(f"Unexpected XML response for {up_type}: {text}")
+                                try:
+                                    j = r2.json()
+                                except Exception as je:
+                                    logger.warning(f"JSON parse failed for {up_type}/{field_name}: {je} raw={text[:2000]}")
+                                    raise
+                                
+                                token = j.get("token") if j else None
+                                if not token and j and "photos" in j:
+                                    for v in j["photos"].values():
+                                        if isinstance(v, dict) and "token" in v:
+                                            token = v["token"]
+                                            break
+                                if not token:
+                                    raise RuntimeError(f"No token: {j}")
+                                attachments.append({"type": up_type, "payload": {"token": token}})
+                                logger.info(f"Uploaded {path} as {up_type} token={token[:20]}...")
+                                uploaded = True
+                                break
+                        except Exception as e:
+                            last_err = e
+                            logger.warning(f"Upload as {up_type}/{field_name} attempt {upload_attempt+1} failed: {e}")
+                            time.sleep(5 * (upload_attempt+1))
+                            continue
+                    if uploaded:
+                        break
                 if uploaded:
                     break
             
