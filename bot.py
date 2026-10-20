@@ -219,30 +219,48 @@ def tg_entities_to_max_markdown(text, entities):
 
 _telethon_client = None
 _telethon_lock = threading.Lock()
+_telethon_download_lock = threading.Lock()
 
 def get_telethon_client_sync():
     global _telethon_client
     if _telethon_client:
-        return _telethon_client
+        try:
+            # Проверка что клиент еще подключен
+            if _telethon_client.is_connected():
+                return _telethon_client
+        except:
+            pass
     with _telethon_lock:
         if _telethon_client:
-            return _telethon_client
+            try:
+                if _telethon_client.is_connected():
+                    return _telethon_client
+            except:
+                pass
         if not API_ID or not API_HASH:
             logger.warning("No API_ID/HASH for telethon")
             return None
         try:
             from telethon import TelegramClient
-            sess_path = "/tmp/bot_telethon_main"
-            client = TelegramClient(sess_path, int(API_ID), API_HASH)
+            from telethon.sessions import MemorySession
+            # MemorySession чтобы избежать database is locked
+            client = TelegramClient(MemorySession(), int(API_ID), API_HASH)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(client.start(bot_token=TG_BOT_TOKEN))
             _telethon_client = client
             _telethon_client._loop = loop
-            logger.info("Telethon global client started")
+            logger.info("Telethon global client started (MemorySession)")
             return _telethon_client
         except Exception as e:
             logger.exception(f"Telethon global client start failed: {e}")
+            # Удаляем битый файл сессии если был
+            try:
+                for f in ["/tmp/bot_telethon_main.session", "/tmp/bot_telethon_main.session-journal"]:
+                    if os.path.exists(f):
+                        os.remove(f)
+            except:
+                pass
             return None
 
 def download_via_telethon_sync(chat_id, message_id):
@@ -250,9 +268,11 @@ def download_via_telethon_sync(chat_id, message_id):
         from telethon.errors import FloodWaitError
     except:
         FloodWaitError = Exception
-    client = get_telethon_client_sync()
-    if not client:
-        return None
+    # Лочим чтобы не было параллельных скачек через один клиент (database is locked)
+    with _telethon_download_lock:
+        client = get_telethon_client_sync()
+        if not client:
+            return None
     async def _run():
         try:
             try:
@@ -328,73 +348,75 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
             path = convert_to_mp4_if_needed(path)
             return path
         logger.warning("Telethon failed, falling back to Bot API")
+    # 1. Пробуем local API
     try:
         r = requests.get(f"{LOCAL_API}/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
         data = r.json()
-        if not data.get("ok"):
-            logger.warning(f"getFile failed: {data}")
-            return None
-        fp = data["result"]["file_path"]
-        logger.info(f"getFile returned: {fp}")
-        ext = os.path.splitext(fp)[-1] or ".jpg"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-        tmp.close()
-        candidates = []
-        norm = fp.lstrip("/")
-        if norm.startswith("var/lib/telegram-bot-api/"):
-            tmp_norm = norm[len("var/lib/telegram-bot-api/"):]
-            if "/" in tmp_norm and ":" in tmp_norm.split("/")[0]:
-                candidates.append(tmp_norm.split("/", 1)[1])
-            candidates.append(tmp_norm)
-        candidates += [fp.lstrip("/"), fp]
-        bases = [LOCAL_API.rstrip("/"), "https://api.telegram.org"]
-        for attempt in range(2):
-            for base in bases:
-                for cand in candidates:
-                    if "api.telegram.org" in base:
-                        short_cand = cand
-                        if "var/lib/telegram-bot-api" in cand:
-                            parts = cand.split("/")
-                            for i, p in enumerate(parts):
-                                if p in ("videos","photos","documents","animations","voice","video_notes"):
-                                    short_cand = "/".join(parts[i:])
-                                    break
-                        for try_cand in [fp, short_cand]:
-                            url = f"{base}/file/bot{TG_BOT_TOKEN}/{try_cand.lstrip('/')}"
-                            logger.info(f"Trying download (official fallback): {url}")
-                            try:
-                                with requests.get(url, stream=True, timeout=300) as resp:
-                                    resp.raise_for_status()
-                                    with open(tmp.name, "wb") as f:
-                                        for ch in resp.iter_content(1024*1024):
-                                            if ch: f.write(ch)
-                                    if os.path.getsize(tmp.name) > 0:
-                                        logger.info(f"Success via official API {url} size={os.path.getsize(tmp.name)}")
-                                        return convert_to_mp4_if_needed(tmp.name)
-                            except Exception as e:
-                                logger.warning(f"Fail official {url}: {e}")
-                                continue
-                        continue
-                    url = f"{base}/file/bot{TG_BOT_TOKEN}/{cand}".replace(f"/bot{TG_BOT_TOKEN}//", f"/bot{TG_BOT_TOKEN}/")
-                    logger.info(f"Trying download: {url}")
-                    try:
-                        with requests.get(url, stream=True, timeout=300) as resp:
-                            resp.raise_for_status()
-                            with open(tmp.name, "wb") as f:
-                                for ch in resp.iter_content(1024*1024):
-                                    if ch: f.write(ch)
-                            if os.path.getsize(tmp.name) > 0:
-                                logger.info(f"Success via {url} size={os.path.getsize(tmp.name)}")
-                                return convert_to_mp4_if_needed(tmp.name)
-                    except Exception as e:
-                        logger.warning(f"Fail {url}: {e}")
-                        continue
-            time.sleep(2)
-        logger.error(f"All download attempts failed for file_id {file_id} fp {fp}")
-        return None
+        if data.get("ok"):
+            fp = data["result"]["file_path"]
+            logger.info(f"getFile local returned: {fp}")
+            ext = os.path.splitext(fp)[-1] or ".jpg"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+            tmp.close()
+            candidates = []
+            norm = fp.lstrip("/")
+            if norm.startswith("var/lib/telegram-bot-api/"):
+                tmp_norm = norm[len("var/lib/telegram-bot-api/"):]
+                if "/" in tmp_norm and ":" in tmp_norm.split("/")[0]:
+                    candidates.append(tmp_norm.split("/", 1)[1])
+                candidates.append(tmp_norm)
+            candidates += [fp.lstrip("/"), fp]
+            for cand in candidates:
+                url = f"{LOCAL_API.rstrip('/')}/file/bot{TG_BOT_TOKEN}/{cand}".replace(f"/bot{TG_BOT_TOKEN}//", f"/bot{TG_BOT_TOKEN}/")
+                logger.info(f"Trying download local: {url}")
+                try:
+                    with requests.get(url, stream=True, timeout=300) as resp:
+                        resp.raise_for_status()
+                        with open(tmp.name, "wb") as f:
+                            for ch in resp.iter_content(1024*1024):
+                                if ch: f.write(ch)
+                        if os.path.getsize(tmp.name) > 0:
+                            logger.info(f"Success via local {url} size={os.path.getsize(tmp.name)}")
+                            return convert_to_mp4_if_needed(tmp.name)
+                except Exception as e:
+                    logger.warning(f"Fail local {url}: {e}")
+                    continue
+        else:
+            logger.warning(f"getFile local failed: {data}")
     except Exception as e:
-        logger.exception(f"download_tg_file error: {e}")
+        logger.warning(f"Local getFile error: {e}")
+
+    # 2. Fallback: официальный Telegram API - заново вызываем getFile на официальном сервере
+    try:
+        logger.info(f"Trying official Telegram API getFile for {file_id}")
+        r2 = requests.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
+        data2 = r2.json()
+        if not data2.get("ok"):
+            logger.warning(f"getFile official failed: {data2}")
+            return None
+        fp2 = data2["result"]["file_path"]
+        logger.info(f"getFile official returned: {fp2}")
+        ext2 = os.path.splitext(fp2)[-1] or ".jpg"
+        tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=ext2)
+        tmp2.close()
+        url2 = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{fp2}"
+        logger.info(f"Trying download official: {url2}")
+        try:
+            with requests.get(url2, stream=True, timeout=300) as resp:
+                resp.raise_for_status()
+                with open(tmp2.name, "wb") as f:
+                    for ch in resp.iter_content(1024*1024):
+                        if ch: f.write(ch)
+                if os.path.getsize(tmp2.name) > 0:
+                    logger.info(f"Success via official {url2} size={os.path.getsize(tmp2.name)}")
+                    return convert_to_mp4_if_needed(tmp2.name)
+        except Exception as e:
+            logger.warning(f"Fail official download {url2}: {e}")
+            return None
+    except Exception as e:
+        logger.exception(f"download_tg_file official error: {e}")
         return None
+
 
 def send_to_max_multi(file_paths, caption=None, fmt=None):
     if isinstance(file_paths, str):
