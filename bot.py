@@ -217,17 +217,44 @@ def tg_entities_to_max_markdown(text, entities):
     return inline_text, "markdown" if has_fmt else None
 
 
+_telethon_client = None
+_telethon_lock = threading.Lock()
+
+def get_telethon_client_sync():
+    global _telethon_client
+    if _telethon_client:
+        return _telethon_client
+    with _telethon_lock:
+        if _telethon_client:
+            return _telethon_client
+        if not API_ID or not API_HASH:
+            logger.warning("No API_ID/HASH for telethon")
+            return None
+        try:
+            from telethon import TelegramClient
+            sess_path = "/tmp/bot_telethon_main"
+            client = TelegramClient(sess_path, int(API_ID), API_HASH)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(client.start(bot_token=TG_BOT_TOKEN))
+            _telethon_client = client
+            _telethon_client._loop = loop
+            logger.info("Telethon global client started")
+            return _telethon_client
+        except Exception as e:
+            logger.exception(f"Telethon global client start failed: {e}")
+            return None
+
 def download_via_telethon_sync(chat_id, message_id):
-    if not API_ID or not API_HASH:
-        logger.warning("No API_ID/HASH for telethon")
+    try:
+        from telethon.errors import FloodWaitError
+    except:
+        FloodWaitError = Exception
+    client = get_telethon_client_sync()
+    if not client:
         return None
     async def _run():
-        from telethon import TelegramClient
-        sess_name = f"/tmp/bot_sess_{message_id}_{int(time.time())}"
-        client = TelegramClient(sess_name, int(API_ID), API_HASH)
         try:
-            await client.start(bot_token=TG_BOT_TOKEN)
-            logger.info(f"Telethon started, getting entity {chat_id}")
             try:
                 entity = await client.get_entity(chat_id)
             except Exception as e:
@@ -240,16 +267,11 @@ def download_via_telethon_sync(chat_id, message_id):
                     from telethon.tl.types import PeerChannel
                     raw_id = int(str(chat_id).replace("-100", ""))
                     entity = await client.get_entity(PeerChannel(raw_id))
-            
             logger.info(f"Got entity {entity}, getting msg {message_id}")
             msg = await client.get_messages(entity, ids=message_id)
-            if not msg:
-                logger.warning(f"Telethon: msg {message_id} not found")
+            if not msg or not msg.media:
+                logger.warning(f"Telethon: msg {message_id} no media")
                 return None
-            if not msg.media:
-                logger.warning(f"Telethon: msg {message_id} has no media")
-                return None
-            
             tmp_dir = tempfile.gettempdir()
             ext = ".mp4"
             if hasattr(msg.file, 'name') and msg.file.name:
@@ -271,24 +293,29 @@ def download_via_telethon_sync(chat_id, message_id):
             path = await client.download_media(msg, file=tmp_path)
             logger.info(f"Telethon downloaded: {path} size={os.path.getsize(path) if path and os.path.exists(path) else 0}")
             return path
-        finally:
-            try:
-                await client.disconnect()
-            except:
-                pass
-            try:
-                for f in [sess_name + ".session", sess_name + ".session-journal"]:
-                    if os.path.exists(f):
-                        os.remove(f)
-            except:
-                pass
-
+        except FloodWaitError as fw:
+            wait_sec = getattr(fw, 'seconds', 0)
+            logger.warning(f"Telethon FloodWait {wait_sec}s, skipping telethon")
+            return None
+        except Exception as e:
+            if "FloodWait" in str(type(e)) or "wait of" in str(e).lower():
+                logger.warning(f"Telethon flood detected, skipping: {e}")
+                return None
+            raise
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(_run())
-        loop.close()
-        return result
+        loop = getattr(client, '_loop', None)
+        if not loop:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        if loop.is_running():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            result = new_loop.run_until_complete(_run())
+            new_loop.close()
+            asyncio.set_event_loop(loop)
+            return result
+        else:
+            return loop.run_until_complete(_run())
     except Exception as e:
         logger.exception(f"Telethon download failed: {e}")
         return None
@@ -301,7 +328,6 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
             path = convert_to_mp4_if_needed(path)
             return path
         logger.warning("Telethon failed, falling back to Bot API")
-
     try:
         r = requests.get(f"{LOCAL_API}/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
         data = r.json()
@@ -313,7 +339,6 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
         ext = os.path.splitext(fp)[-1] or ".jpg"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.close()
-
         candidates = []
         norm = fp.lstrip("/")
         if norm.startswith("var/lib/telegram-bot-api/"):
@@ -322,11 +347,34 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
                 candidates.append(tmp_norm.split("/", 1)[1])
             candidates.append(tmp_norm)
         candidates += [fp.lstrip("/"), fp]
-        
-        bases = [LOCAL_API.rstrip("/")]
+        bases = [LOCAL_API.rstrip("/"), "https://api.telegram.org"]
         for attempt in range(2):
             for base in bases:
                 for cand in candidates:
+                    if "api.telegram.org" in base:
+                        short_cand = cand
+                        if "var/lib/telegram-bot-api" in cand:
+                            parts = cand.split("/")
+                            for i, p in enumerate(parts):
+                                if p in ("videos","photos","documents","animations","voice","video_notes"):
+                                    short_cand = "/".join(parts[i:])
+                                    break
+                        for try_cand in [fp, short_cand]:
+                            url = f"{base}/file/bot{TG_BOT_TOKEN}/{try_cand.lstrip('/')}"
+                            logger.info(f"Trying download (official fallback): {url}")
+                            try:
+                                with requests.get(url, stream=True, timeout=300) as resp:
+                                    resp.raise_for_status()
+                                    with open(tmp.name, "wb") as f:
+                                        for ch in resp.iter_content(1024*1024):
+                                            if ch: f.write(ch)
+                                    if os.path.getsize(tmp.name) > 0:
+                                        logger.info(f"Success via official API {url} size={os.path.getsize(tmp.name)}")
+                                        return convert_to_mp4_if_needed(tmp.name)
+                            except Exception as e:
+                                logger.warning(f"Fail official {url}: {e}")
+                                continue
+                        continue
                     url = f"{base}/file/bot{TG_BOT_TOKEN}/{cand}".replace(f"/bot{TG_BOT_TOKEN}//", f"/bot{TG_BOT_TOKEN}/")
                     logger.info(f"Trying download: {url}")
                     try:
@@ -336,12 +384,13 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
                                 for ch in resp.iter_content(1024*1024):
                                     if ch: f.write(ch)
                             if os.path.getsize(tmp.name) > 0:
-                                logger.info(f"Success via {url}")
-                                return tmp.name
+                                logger.info(f"Success via {url} size={os.path.getsize(tmp.name)}")
+                                return convert_to_mp4_if_needed(tmp.name)
                     except Exception as e:
                         logger.warning(f"Fail {url}: {e}")
                         continue
             time.sleep(2)
+        logger.error(f"All download attempts failed for file_id {file_id} fp {fp}")
         return None
     except Exception as e:
         logger.exception(f"download_tg_file error: {e}")
