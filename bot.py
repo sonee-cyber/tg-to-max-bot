@@ -2,50 +2,83 @@ import os, tempfile, logging, time, requests, telebot, threading, asyncio, subpr
 from telebot.types import Message
 
 def convert_to_mp4_if_needed(src_path):
-    """Для твоих 1 мин 1080p 30fps ~30МБ .MOV HEVC -> H264 mp4 чтобы MAX принял как video с плеером"""
+    """Дожимает видео до <50МБ чтобы не падал таймаут на okcdn"""
     ext = os.path.splitext(src_path)[1].lower()
     if ext not in [".mov", ".avi", ".mkv", ".mp4", ".webm"]:
         return src_path
-    size_mb = os.path.getsize(src_path) / (1024*1024)
-    if size_mb > 80:
-        crf = "28"
-        extra_vf = ["-vf", "scale=-2:720"]
-    else:
-        crf = "23"
-        extra_vf = []
-    
-    dst_path = os.path.splitext(src_path)[0] + "_h264.mp4"
-    ffmpeg_exe = "ffmpeg"
-    try:
+
+    def try_convert(inp, out, crf, scale, audio_br, preset="fast"):
+        ffmpeg_exe = "ffmpeg"
         try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            logger.info(f"Using imageio-ffmpeg: {ffmpeg_exe}")
-        except:
-            pass
-        cmd = [ffmpeg_exe, "-y", "-i", src_path, "-c:v", "libx264", "-preset", "fast", "-crf", crf, "-pix_fmt", "yuv420p", "-profile:v", "high", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"] + extra_vf + [dst_path]
-        logger.info(f"Converting {src_path} -> {dst_path} via ffmpeg...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 1000:
-            orig = os.path.getsize(src_path)
-            new = os.path.getsize(dst_path)
-            logger.info(f"Converted OK: {orig} -> {new} bytes ({orig/new:.1f}x)")
             try:
-                os.remove(src_path)
+                import imageio_ffmpeg
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             except:
                 pass
-            return dst_path
-        else:
-            logger.warning(f"ffmpeg failed code={result.returncode}: {result.stderr[:2000]}")
-            try:
-                if os.path.exists(dst_path):
-                    os.remove(dst_path)
-            except:
-                pass
-            return src_path
-    except Exception as e:
-        logger.warning(f"Convert error (ffmpeg not available?): {e}")
+            vf = []
+            if scale:
+                vf = ["-vf", f"scale=-2:{scale}"]
+            cmd = [ffmpeg_exe, "-y", "-i", inp, "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                   "-pix_fmt", "yuv420p", "-profile:v", "high", "-c:a", "aac", "-b:a", f"{audio_br}k",
+                   "-movflags", "+faststart"] + vf + [out]
+            logger.info(f"Converting {inp} -> {out} crf={crf} scale={scale} audio={audio_br}k preset={preset}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
+                return True
+            else:
+                logger.warning(f"ffmpeg failed crf={crf} scale={scale}: code={result.returncode} err={result.stderr[:1000]}")
+                try:
+                    if os.path.exists(out):
+                        os.remove(out)
+                except:
+                    pass
+                return False
+        except Exception as e:
+            logger.warning(f"Convert error: {e}")
+            return False
+
+    size_mb = os.path.getsize(src_path) / (1024*1024)
+    logger.info(f"Source video size: {size_mb:.1f} MB {src_path}")
+
+    if size_mb < 20:
+        dst = os.path.splitext(src_path)[0] + "_h264.mp4"
+        if try_convert(src_path, dst, 23, None, 128):
+            try: os.remove(src_path)
+            except: pass
+            return dst
         return src_path
+
+    attempts = [
+        (28, 720, 128, "fast"),
+        (30, 720, 96, "fast"),
+        (30, 540, 96, "fast"),
+        (32, 540, 64, "veryfast"),
+        (32, 480, 64, "veryfast"),
+        (33, 360, 64, "veryfast"),
+    ]
+
+    current = src_path
+    for crf, scale, abr, preset in attempts:
+        dst = os.path.splitext(current)[0] + f"_h264_{scale}_{crf}.mp4"
+        ok = try_convert(current, dst, crf, scale, abr, preset)
+        if not ok:
+            continue
+        new_size_mb = os.path.getsize(dst) / (1024*1024)
+        logger.info(f"Converted to {new_size_mb:.1f} MB (crf={crf} scale={scale})")
+        if current != src_path:
+            try: os.remove(current)
+            except: pass
+        else:
+            try: os.remove(src_path)
+            except: pass
+        current = dst
+        if new_size_mb < 50:
+            logger.info(f"Got <50MB: {new_size_mb:.1f} MB, stopping")
+            return current
+
+    final_mb = os.path.getsize(current) / (1024*1024)
+    logger.info(f"Final video size after all attempts: {final_mb:.1f} MB")
+    return current
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
@@ -217,64 +250,17 @@ def tg_entities_to_max_markdown(text, entities):
     return inline_text, "markdown" if has_fmt else None
 
 
-_telethon_client = None
-_telethon_lock = threading.Lock()
-_telethon_download_lock = threading.Lock()
-
-def get_telethon_client_sync():
-    global _telethon_client
-    if _telethon_client:
-        try:
-            # Проверка что клиент еще подключен
-            if _telethon_client.is_connected():
-                return _telethon_client
-        except:
-            pass
-    with _telethon_lock:
-        if _telethon_client:
-            try:
-                if _telethon_client.is_connected():
-                    return _telethon_client
-            except:
-                pass
-        if not API_ID or not API_HASH:
-            logger.warning("No API_ID/HASH for telethon")
-            return None
-        try:
-            from telethon import TelegramClient
-            from telethon.sessions import MemorySession
-            # MemorySession чтобы избежать database is locked
-            client = TelegramClient(MemorySession(), int(API_ID), API_HASH)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(client.start(bot_token=TG_BOT_TOKEN))
-            _telethon_client = client
-            _telethon_client._loop = loop
-            logger.info("Telethon global client started (MemorySession)")
-            return _telethon_client
-        except Exception as e:
-            logger.exception(f"Telethon global client start failed: {e}")
-            # Удаляем битый файл сессии если был
-            try:
-                for f in ["/tmp/bot_telethon_main.session", "/tmp/bot_telethon_main.session-journal"]:
-                    if os.path.exists(f):
-                        os.remove(f)
-            except:
-                pass
-            return None
-
 def download_via_telethon_sync(chat_id, message_id):
-    try:
-        from telethon.errors import FloodWaitError
-    except:
-        FloodWaitError = Exception
-    # Лочим чтобы не было параллельных скачек через один клиент (database is locked)
-    with _telethon_download_lock:
-        client = get_telethon_client_sync()
-        if not client:
-            return None
+    if not API_ID or not API_HASH:
+        logger.warning("No API_ID/HASH for telethon")
+        return None
     async def _run():
+        from telethon import TelegramClient
+        sess_name = f"/tmp/bot_sess_{message_id}_{int(time.time())}"
+        client = TelegramClient(sess_name, int(API_ID), API_HASH)
         try:
+            await client.start(bot_token=TG_BOT_TOKEN)
+            logger.info(f"Telethon started, getting entity {chat_id}")
             try:
                 entity = await client.get_entity(chat_id)
             except Exception as e:
@@ -287,11 +273,16 @@ def download_via_telethon_sync(chat_id, message_id):
                     from telethon.tl.types import PeerChannel
                     raw_id = int(str(chat_id).replace("-100", ""))
                     entity = await client.get_entity(PeerChannel(raw_id))
+            
             logger.info(f"Got entity {entity}, getting msg {message_id}")
             msg = await client.get_messages(entity, ids=message_id)
-            if not msg or not msg.media:
-                logger.warning(f"Telethon: msg {message_id} no media")
+            if not msg:
+                logger.warning(f"Telethon: msg {message_id} not found")
                 return None
+            if not msg.media:
+                logger.warning(f"Telethon: msg {message_id} has no media")
+                return None
+            
             tmp_dir = tempfile.gettempdir()
             ext = ".mp4"
             if hasattr(msg.file, 'name') and msg.file.name:
@@ -313,29 +304,24 @@ def download_via_telethon_sync(chat_id, message_id):
             path = await client.download_media(msg, file=tmp_path)
             logger.info(f"Telethon downloaded: {path} size={os.path.getsize(path) if path and os.path.exists(path) else 0}")
             return path
-        except FloodWaitError as fw:
-            wait_sec = getattr(fw, 'seconds', 0)
-            logger.warning(f"Telethon FloodWait {wait_sec}s, skipping telethon")
-            return None
-        except Exception as e:
-            if "FloodWait" in str(type(e)) or "wait of" in str(e).lower():
-                logger.warning(f"Telethon flood detected, skipping: {e}")
-                return None
-            raise
+        finally:
+            try:
+                await client.disconnect()
+            except:
+                pass
+            try:
+                for f in [sess_name + ".session", sess_name + ".session-journal"]:
+                    if os.path.exists(f):
+                        os.remove(f)
+            except:
+                pass
+
     try:
-        loop = getattr(client, '_loop', None)
-        if not loop:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        if loop.is_running():
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
-            result = new_loop.run_until_complete(_run())
-            new_loop.close()
-            asyncio.set_event_loop(loop)
-            return result
-        else:
-            return loop.run_until_complete(_run())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(_run())
+        loop.close()
+        return result
     except Exception as e:
         logger.exception(f"Telethon download failed: {e}")
         return None
@@ -348,24 +334,26 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
             path = convert_to_mp4_if_needed(path)
             return path
         logger.warning("Telethon failed, falling back to Bot API")
+
     # 1. Пробуем local API
+    local_fp = None
     try:
         r = requests.get(f"{LOCAL_API}/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
         data = r.json()
         if data.get("ok"):
-            fp = data["result"]["file_path"]
-            logger.info(f"getFile local returned: {fp}")
-            ext = os.path.splitext(fp)[-1] or ".jpg"
+            local_fp = data["result"]["file_path"]
+            logger.info(f"getFile local returned: {local_fp}")
+            ext = os.path.splitext(local_fp)[-1] or ".jpg"
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
             tmp.close()
             candidates = []
-            norm = fp.lstrip("/")
+            norm = local_fp.lstrip("/")
             if norm.startswith("var/lib/telegram-bot-api/"):
                 tmp_norm = norm[len("var/lib/telegram-bot-api/"):]
                 if "/" in tmp_norm and ":" in tmp_norm.split("/")[0]:
                     candidates.append(tmp_norm.split("/", 1)[1])
                 candidates.append(tmp_norm)
-            candidates += [fp.lstrip("/"), fp]
+            candidates += [local_fp.lstrip("/"), local_fp]
             for cand in candidates:
                 url = f"{LOCAL_API.rstrip('/')}/file/bot{TG_BOT_TOKEN}/{cand}".replace(f"/bot{TG_BOT_TOKEN}//", f"/bot{TG_BOT_TOKEN}/")
                 logger.info(f"Trying download local: {url}")
@@ -374,7 +362,8 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
                         resp.raise_for_status()
                         with open(tmp.name, "wb") as f:
                             for ch in resp.iter_content(1024*1024):
-                                if ch: f.write(ch)
+                                if ch:
+                                    f.write(ch)
                         if os.path.getsize(tmp.name) > 0:
                             logger.info(f"Success via local {url} size={os.path.getsize(tmp.name)}")
                             return convert_to_mp4_if_needed(tmp.name)
@@ -386,13 +375,13 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
     except Exception as e:
         logger.warning(f"Local getFile error: {e}")
 
-    # 2. Fallback: официальный Telegram API - заново вызываем getFile на официальном сервере
+    # 2. Fallback на официальный API - для файлов <20MB (большие вернут file is too big, тогда только Telethon мог)
     try:
         logger.info(f"Trying official Telegram API getFile for {file_id}")
         r2 = requests.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=60)
         data2 = r2.json()
         if not data2.get("ok"):
-            logger.warning(f"getFile official failed: {data2}")
+            logger.warning(f"getFile official failed: {data2} (likely file is too big >20MB, needs Telethon)")
             return None
         fp2 = data2["result"]["file_path"]
         logger.info(f"getFile official returned: {fp2}")
@@ -401,22 +390,19 @@ def download_tg_file(file_id: str, chat_id=None, message_id=None):
         tmp2.close()
         url2 = f"https://api.telegram.org/file/bot{TG_BOT_TOKEN}/{fp2}"
         logger.info(f"Trying download official: {url2}")
-        try:
-            with requests.get(url2, stream=True, timeout=300) as resp:
-                resp.raise_for_status()
-                with open(tmp2.name, "wb") as f:
-                    for ch in resp.iter_content(1024*1024):
-                        if ch: f.write(ch)
-                if os.path.getsize(tmp2.name) > 0:
-                    logger.info(f"Success via official {url2} size={os.path.getsize(tmp2.name)}")
-                    return convert_to_mp4_if_needed(tmp2.name)
-        except Exception as e:
-            logger.warning(f"Fail official download {url2}: {e}")
-            return None
+        with requests.get(url2, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            with open(tmp2.name, "wb") as f:
+                for ch in resp.iter_content(1024*1024):
+                    if ch:
+                        f.write(ch)
+            if os.path.getsize(tmp2.name) > 0:
+                logger.info(f"Success via official {url2} size={os.path.getsize(tmp2.name)}")
+                return convert_to_mp4_if_needed(tmp2.name)
     except Exception as e:
         logger.exception(f"download_tg_file official error: {e}")
         return None
-
+    return None
 
 def send_to_max_multi(file_paths, caption=None, fmt=None):
     if isinstance(file_paths, str):
@@ -445,6 +431,7 @@ def send_to_max_multi(file_paths, caption=None, fmt=None):
             
             for up_type in types_to_try:
                 for field_name in ["data", "file"]:
+                    # ретраи на загрузку в okcdn - для больших файлов часто падает write timeout
                     for upload_attempt in range(3):
                         try:
                             mime = "video/mp4" if up_type == "video" else "application/octet-stream"
@@ -460,6 +447,7 @@ def send_to_max_multi(file_paths, caption=None, fmt=None):
                             logger.info(f"First response {up_type}: url={upload_url[:100]}... token={str(first_token)[:20]}...")
                             with open(path, "rb") as f:
                                 files = {field_name: (base_name, f, mime)}
+                                # увеличенный таймаут для больших файлов - 10 минут
                                 r2 = requests.post(upload_url, files=files, timeout=600)
                                 logger.info(f"Upload response {up_type}/{field_name}: status={r2.status_code} text={r2.text[:2000]}")
                                 if r2.status_code >= 400:
